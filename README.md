@@ -39,7 +39,7 @@ Open `http://<your-lan-ip>:5001` from any device on the same network.
 | Tab | Content |
 |-----|---------|
 | Overview | Cost cards (today/week/month/all-time), daily cost chart, token stacked chart, entrypoint & model distribution |
-| Sessions | Filterable/paginated session list; click any row for per-API-call token breakdown |
+| Sessions | Filterable/paginated session list with **IM badge** and "IM only" filter; click any row for per-API-call token breakdown |
 | Projects | Cost by project, table with full metrics |
 | Tools | Call count & error rate charts, detailed table |
 | Models | Per-model token and cost breakdown |
@@ -77,11 +77,21 @@ Claude Code fires a **Stop hook** at the end of every session, passing a JSON pa
 
 `tracker.py` reads the JSONL transcript, extracts every assistant API response (with full `usage` fields), and writes to SQLite.
 
+### IM session detection
+
+If you use [claude-to-im](https://github.com/anthropics/claude-to-im) to serve Claude via messaging apps (Feishu, Telegram, etc.), those sessions are automatically tagged with `im_source = 'cti'` in the database.
+
+**How it works:** claude-to-im passes `CTI_*` environment variables to the Claude Code subprocess it spawns. The Stop hook inherits these variables. `tracker.py` checks for `CTI_RUNTIME` at hook time — if present, the session is marked as IM-originated. No configuration required.
+
+Sessions without `CTI_RUNTIME` (direct CLI usage) have `im_source = NULL`.
+
+> **Note:** Historical sessions backfilled via `--backfill` cannot be tagged retroactively since the runtime environment is no longer available. Only sessions recorded after install will carry the IM tag.
+
 ### Database schema
 
 | Table | Description |
 |-------|-------------|
-| `sessions` | One row per session — aggregated token totals, cost, duration, entrypoint |
+| `sessions` | One row per session — aggregated token totals, cost, duration, entrypoint, `im_source` |
 | `api_calls` | One row per API response — input/output/cache tokens, model, stop reason, tool count |
 | `tool_calls` | One row per tool invocation — tool name, input size, result size, error status |
 | `daily_summary` | Pre-aggregated daily rollup for fast dashboard queries |
