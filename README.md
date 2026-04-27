@@ -1,6 +1,6 @@
 # Claude Token Tracker
 
-<img src="static/images/logo.svg" width="80" alt="Claude Token Tracker logo">
+<img src="https://raw.githubusercontent.com/xiaohaoxing/claude-token-tracker/main/static/images/logo.svg" width="80" alt="Claude Token Tracker logo">
 
 [English](#english) | [中文](#中文)
 
