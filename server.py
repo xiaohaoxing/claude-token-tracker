@@ -20,6 +20,7 @@ app = Flask(__name__,
             template_folder=str(TMPL_DIR),
             static_folder=str(Path(__file__).parent / "static"))
 app.config["JSON_SORT_KEYS"] = False
+app.config["TEMPLATES_AUTO_RELOAD"] = True
 
 
 # ── DB helper ────────────────────────────────────────────────────────────────
