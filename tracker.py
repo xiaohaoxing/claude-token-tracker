@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     models_used           TEXT,   -- JSON array of distinct model ids
     first_user_message    TEXT,   -- first 500 chars of first human turn
     transcript_path       TEXT,
+    im_source             TEXT,   -- 'cti' if launched via claude-to-im, else NULL
 
     created_at  TEXT DEFAULT (datetime('now')),
     updated_at  TEXT DEFAULT (datetime('now'))
@@ -169,6 +170,10 @@ def open_db() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     con.executescript(SCHEMA)
+    # Migrate: add im_source if this is an existing DB without it
+    cols = {r[1] for r in con.execute("PRAGMA table_info(sessions)")}
+    if "im_source" not in cols:
+        con.execute("ALTER TABLE sessions ADD COLUMN im_source TEXT")
     con.commit()
     return con
 
@@ -388,6 +393,7 @@ def parse_transcript(path: str) -> dict:
         "models_used":                 json.dumps(sorted(models_seen)),
         "first_user_message":          first_user_message,
         "transcript_path":             path,
+        "im_source":                   None,  # filled in by run_hook() when CTI_RUNTIME is set
     }
 
     return {"session_meta": session_meta, "api_calls": api_call_records, "tool_calls": tool_call_records}
@@ -402,7 +408,7 @@ def upsert_session(con: sqlite3.Connection, meta: dict) -> None:
             total_cache_read_tokens, total_cache_1h_tokens, total_cache_5m_tokens,
             total_cost_usd, total_turns, total_api_calls, total_tool_calls,
             total_thinking_blocks, total_output_chars,
-            models_used, first_user_message, transcript_path, updated_at
+            models_used, first_user_message, transcript_path, im_source, updated_at
         ) VALUES (
             :session_id, :started_at, :ended_at, :duration_seconds,
             :cwd, :project_slug, :entrypoint, :git_branch, :claude_version, :user_type,
@@ -410,7 +416,7 @@ def upsert_session(con: sqlite3.Connection, meta: dict) -> None:
             :total_cache_read_tokens, :total_cache_1h_tokens, :total_cache_5m_tokens,
             :total_cost_usd, :total_turns, :total_api_calls, :total_tool_calls,
             :total_thinking_blocks, :total_output_chars,
-            :models_used, :first_user_message, :transcript_path, datetime('now')
+            :models_used, :first_user_message, :transcript_path, :im_source, datetime('now')
         )
         ON CONFLICT(session_id) DO UPDATE SET
             ended_at                    = excluded.ended_at,
@@ -429,6 +435,7 @@ def upsert_session(con: sqlite3.Connection, meta: dict) -> None:
             total_output_chars          = excluded.total_output_chars,
             models_used                 = excluded.models_used,
             transcript_path             = excluded.transcript_path,
+            im_source                   = COALESCE(excluded.im_source, sessions.im_source),
             updated_at                  = datetime('now')
     """, meta)
 
@@ -511,7 +518,8 @@ def rebuild_daily_summary(con: sqlite3.Connection, dates: list[str]) -> None:
                   row["total_cost_usd"], row["unique_cwds"]))
 
 
-def process_session(con: sqlite3.Connection, session_id: str, transcript_path: str) -> bool:
+def process_session(con: sqlite3.Connection, session_id: str, transcript_path: str,
+                    im_source: str | None = None) -> bool:
     parsed = parse_transcript(transcript_path)
     if not parsed or not parsed.get("session_meta"):
         return False
@@ -522,6 +530,11 @@ def process_session(con: sqlite3.Connection, session_id: str, transcript_path: s
 
     if not meta.get("session_id"):
         meta["session_id"] = session_id
+
+    if im_source and not meta.get("im_source"):
+        meta["im_source"] = im_source
+    elif "im_source" not in meta:
+        meta["im_source"] = None
 
     upsert_session(con, meta)
     insert_api_calls(con, api_calls)
@@ -564,9 +577,13 @@ def run_hook() -> None:
     if not session_id or not transcript_path:
         sys.exit(0)
 
+    # Detect IM origin: claude-to-im passes CTI_* env vars to the Claude subprocess,
+    # which the Stop hook inherits. CTI_RUNTIME being set is the reliable signal.
+    im_source = "cti" if os.environ.get("CTI_RUNTIME") else None
+
     con = open_db()
     try:
-        process_session(con, session_id, transcript_path)
+        process_session(con, session_id, transcript_path, im_source=im_source)
     finally:
         con.close()
 

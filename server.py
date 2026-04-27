@@ -99,6 +99,7 @@ def sessions():
     offset  = int(request.args.get("offset", 0))
     project = request.args.get("project", "").strip()
     entry   = request.args.get("entrypoint", "").strip()
+    im_only = request.args.get("im_only", "").strip()
 
     clauses, params = [], []
     if project:
@@ -107,6 +108,8 @@ def sessions():
     if entry:
         clauses.append("entrypoint = ?")
         params.append(entry)
+    if im_only == "1":
+        clauses.append("im_source IS NOT NULL")
 
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
@@ -118,7 +121,7 @@ def sessions():
                total_cache_creation_tokens, total_cache_read_tokens,
                total_cost_usd, total_turns, total_api_calls, total_tool_calls,
                total_thinking_blocks, duration_seconds,
-               models_used, first_user_message
+               models_used, first_user_message, im_source
         FROM sessions {where}
         ORDER BY started_at DESC
         LIMIT ? OFFSET ?

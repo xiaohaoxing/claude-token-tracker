@@ -117,6 +117,10 @@ tailwind.config = {
     <select id="filter-entry" onchange="loadSessions()">
       <option value="">All entrypoints</option>
     </select>
+    <label class="flex items-center gap-2 text-sm text-slate-400 cursor-pointer select-none">
+      <input type="checkbox" id="filter-im-only" onchange="loadSessions()" class="accent-violet-500 w-4 h-4" />
+      IM only
+    </label>
     <span class="text-xs text-slate-500 ml-auto" id="sessions-count"></span>
   </div>
 
@@ -457,7 +461,8 @@ function debounceLoadSessions() {
 async function loadSessions() {
   const project = document.getElementById('filter-project').value
   const entry   = document.getElementById('filter-entry').value
-  const url = `/api/sessions?limit=${SESS_LIMIT}&offset=${sessOffset}&project=${encodeURIComponent(project)}&entrypoint=${encodeURIComponent(entry)}`
+  const imOnly  = document.getElementById('filter-im-only').checked ? '1' : ''
+  const url = `/api/sessions?limit=${SESS_LIMIT}&offset=${sessOffset}&project=${encodeURIComponent(project)}&entrypoint=${encodeURIComponent(entry)}&im_only=${imOnly}`
   const { sessions, total } = await api(url)
 
   document.getElementById('sessions-count').textContent = `${total} sessions`
@@ -471,11 +476,12 @@ async function loadSessions() {
     const models = (() => { try { return JSON.parse(s.models_used||'[]') } catch { return [] } })()
     const modelTag = models.length ? `<span class="badge bg-violet-900/40 text-violet-300">${esc(models[0].replace('claude-',''))}</span>` : ''
     const entryColor = { cli:'bg-blue-900/40 text-blue-300', 'sdk-ts':'bg-teal-900/40 text-teal-300', 'sdk-python':'bg-green-900/40 text-green-300' }[s.entrypoint] || 'bg-slate-700 text-slate-300'
+    const imBadge = s.im_source ? `<span class="badge bg-fuchsia-900/40 text-fuchsia-300 ml-1">IM</span>` : ''
     return `<tr class="cursor-pointer" onclick="openSession('${esc(s.session_id)}')">
       <td class="font-mono text-xs text-slate-400">${s.session_id.slice(0,8)}</td>
       <td class="text-xs text-slate-300">${fmtDate(s.started_at)}</td>
       <td class="font-medium text-white max-w-32 truncate">${esc(s.project_slug || s.cwd?.split('/').pop())}</td>
-      <td><span class="badge ${entryColor}">${esc(s.entrypoint||'—')}</span></td>
+      <td><span class="badge ${entryColor}">${esc(s.entrypoint||'—')}</span>${imBadge}</td>
       <td class="text-right text-slate-300">${s.total_turns||0}</td>
       <td class="text-right text-slate-300">${s.total_api_calls||0}</td>
       <td class="text-right text-slate-300">${s.total_tool_calls||0}</td>
