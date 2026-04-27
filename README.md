@@ -2,6 +2,8 @@
 
 Tracks token usage and cost for every Claude Code session, stores it in a local SQLite database, and serves a web dashboard for analysis.
 
+![Dashboard](https://p.ipic.vip/9yxdya.png)
+
 ## Prerequisites
 
 - [Claude Code](https://claude.ai/code) installed and configured
