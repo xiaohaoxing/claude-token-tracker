@@ -1,0 +1,738 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Claude Usage Dashboard</title>
+<script src="/static/tailwind.min.js"></script>
+<script src="/static/chart.min.js"></script>
+<script>
+tailwind.config = {
+  darkMode: 'class',
+  theme: {
+    extend: {
+      colors: {
+        brand: { DEFAULT: '#8b5cf6', light: '#a78bfa', dark: '#7c3aed' }
+      }
+    }
+  }
+}
+</script>
+<style>
+  body { background: #0f1117; color: #e2e8f0; font-family: 'Inter', system-ui, sans-serif; }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: #1e2535; }
+  ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
+  .tab-btn { transition: all .15s ease; }
+  .tab-btn.active { background: #8b5cf6; color: #fff; }
+  .card { background: #1a1f2e; border: 1px solid #2d3748; border-radius: 12px; }
+  .stat-card { background: #1a1f2e; border: 1px solid #2d3748; border-radius: 12px; padding: 20px; }
+  .tbl th { background: #161b27; color: #94a3b8; font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; position: sticky; top: 0; z-index: 1; }
+  .tbl tr:hover td { background: #1e2638; }
+  .tbl td, .tbl th { padding: 10px 14px; border-bottom: 1px solid #2d3748; }
+  .badge { display:inline-flex; align-items:center; padding: 2px 8px; border-radius:999px; font-size:.7rem; font-weight:600; }
+  .modal-bg { background: rgba(0,0,0,.75); backdrop-filter: blur(4px); }
+  .spin { animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .chart-wrap { position: relative; height: 260px; }
+  input, select { background: #1a1f2e; border: 1px solid #374151; border-radius: 8px; color: #e2e8f0; padding: 6px 12px; font-size:.875rem; }
+  input:focus, select:focus { outline: none; border-color: #8b5cf6; }
+</style>
+</head>
+<body class="min-h-screen">
+
+<!-- Header -->
+<header class="border-b border-slate-800 px-6 py-4 flex items-center gap-4">
+  <div class="flex items-center gap-3">
+    <svg class="w-7 h-7" viewBox="0 0 32 32" fill="none">
+      <circle cx="16" cy="16" r="16" fill="#8b5cf6" opacity=".15"/>
+      <path d="M10 22 L16 8 L22 22" stroke="#a78bfa" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M12.5 17.5 H19.5" stroke="#a78bfa" stroke-width="2.5" stroke-linecap="round"/>
+    </svg>
+    <span class="font-bold text-lg text-white tracking-tight">Claude Usage</span>
+  </div>
+  <nav class="flex gap-1 ml-8">
+    <button class="tab-btn active px-4 py-1.5 rounded-lg text-sm font-medium" data-tab="overview">Overview</button>
+    <button class="tab-btn px-4 py-1.5 rounded-lg text-sm font-medium text-slate-400 hover:text-white hover:bg-slate-800" data-tab="sessions">Sessions</button>
+    <button class="tab-btn px-4 py-1.5 rounded-lg text-sm font-medium text-slate-400 hover:text-white hover:bg-slate-800" data-tab="projects">Projects</button>
+    <button class="tab-btn px-4 py-1.5 rounded-lg text-sm font-medium text-slate-400 hover:text-white hover:bg-slate-800" data-tab="tools">Tools</button>
+    <button class="tab-btn px-4 py-1.5 rounded-lg text-sm font-medium text-slate-400 hover:text-white hover:bg-slate-800" data-tab="models">Models</button>
+  </nav>
+  <div class="ml-auto flex items-center gap-3">
+    <span id="last-updated" class="text-xs text-slate-500"></span>
+    <button onclick="refreshAll()" class="text-xs bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg text-slate-300 flex items-center gap-1.5">
+      <svg id="refresh-icon" class="w-3.5 h-3.5" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 010 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.057a1 1 0 011.276.61A5.002 5.002 0 0014.001 13H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z" clip-rule="evenodd"/></svg>
+      Refresh
+    </button>
+  </div>
+</header>
+
+<!-- ═══════════════════ OVERVIEW TAB ═══════════════════ -->
+<div id="tab-overview" class="tab-content p-6 space-y-6">
+  <!-- Stat cards -->
+  <div class="grid grid-cols-2 xl:grid-cols-4 gap-4" id="stat-cards">
+    <div class="stat-card" id="card-today"></div>
+    <div class="stat-card" id="card-week"></div>
+    <div class="stat-card" id="card-month"></div>
+    <div class="stat-card" id="card-total"></div>
+  </div>
+
+  <!-- Charts row -->
+  <div class="grid grid-cols-1 xl:grid-cols-3 gap-4">
+    <div class="card p-5 xl:col-span-2">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="font-semibold text-white">Daily Cost</h3>
+        <select id="daily-range" onchange="loadDaily()" class="text-xs">
+          <option value="14">14 days</option>
+          <option value="30" selected>30 days</option>
+          <option value="60">60 days</option>
+          <option value="90">90 days</option>
+        </select>
+      </div>
+      <div class="chart-wrap"><canvas id="chart-daily"></canvas></div>
+    </div>
+    <div class="card p-5">
+      <h3 class="font-semibold text-white mb-4">Entrypoint Split</h3>
+      <div class="chart-wrap"><canvas id="chart-entry"></canvas></div>
+    </div>
+  </div>
+
+  <!-- Second charts row -->
+  <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
+    <div class="card p-5">
+      <h3 class="font-semibold text-white mb-4">Daily Tokens</h3>
+      <div class="chart-wrap"><canvas id="chart-tokens"></canvas></div>
+    </div>
+    <div class="card p-5">
+      <h3 class="font-semibold text-white mb-4">Model Distribution</h3>
+      <div class="chart-wrap"><canvas id="chart-models-pie"></canvas></div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════ SESSIONS TAB ═══════════════════ -->
+<div id="tab-sessions" class="tab-content hidden p-6 space-y-4">
+  <div class="flex items-center gap-3 flex-wrap">
+    <input id="filter-project" placeholder="Filter by project…" class="w-48" oninput="debounceLoadSessions()" />
+    <select id="filter-entry" onchange="loadSessions()">
+      <option value="">All entrypoints</option>
+    </select>
+    <span class="text-xs text-slate-500 ml-auto" id="sessions-count"></span>
+  </div>
+
+  <div class="card overflow-hidden">
+    <div class="overflow-auto max-h-[calc(100vh-220px)]">
+      <table class="tbl w-full text-sm">
+        <thead>
+          <tr>
+            <th class="text-left">Session</th>
+            <th class="text-left">Started</th>
+            <th class="text-left">Project</th>
+            <th class="text-left">Via</th>
+            <th class="text-right">Turns</th>
+            <th class="text-right">API calls</th>
+            <th class="text-right">Tools</th>
+            <th class="text-right">Input</th>
+            <th class="text-right">Output</th>
+            <th class="text-right">Cost</th>
+            <th class="text-right">Duration</th>
+          </tr>
+        </thead>
+        <tbody id="sessions-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="flex justify-between items-center">
+    <button id="prev-page" onclick="prevPage()" class="text-xs bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg disabled:opacity-40" disabled>← Prev</button>
+    <span class="text-xs text-slate-400" id="page-info"></span>
+    <button id="next-page" onclick="nextPage()" class="text-xs bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg disabled:opacity-40" disabled>Next →</button>
+  </div>
+</div>
+
+<!-- ═══════════════════ PROJECTS TAB ═══════════════════ -->
+<div id="tab-projects" class="tab-content hidden p-6 space-y-4">
+  <div class="card p-5">
+    <h3 class="font-semibold text-white mb-4">Cost by Project</h3>
+    <div style="height:280px"><canvas id="chart-projects"></canvas></div>
+  </div>
+  <div class="card overflow-hidden">
+    <div class="overflow-auto max-h-96">
+      <table class="tbl w-full text-sm">
+        <thead>
+          <tr>
+            <th class="text-left">Project</th>
+            <th class="text-right">Sessions</th>
+            <th class="text-right">API calls</th>
+            <th class="text-right">Tool calls</th>
+            <th class="text-right">Input</th>
+            <th class="text-right">Output</th>
+            <th class="text-right">Cache R</th>
+            <th class="text-right">Cost</th>
+            <th class="text-right">Last active</th>
+          </tr>
+        </thead>
+        <tbody id="projects-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════ TOOLS TAB ═══════════════════ -->
+<div id="tab-tools" class="tab-content hidden p-6 space-y-4">
+  <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
+    <div class="card p-5">
+      <h3 class="font-semibold text-white mb-4">Top Tools by Call Count</h3>
+      <div style="height:320px"><canvas id="chart-tools"></canvas></div>
+    </div>
+    <div class="card p-5">
+      <h3 class="font-semibold text-white mb-4">Error Rate by Tool</h3>
+      <div style="height:320px"><canvas id="chart-tool-errors"></canvas></div>
+    </div>
+  </div>
+  <div class="card overflow-hidden">
+    <div class="overflow-auto max-h-96">
+      <table class="tbl w-full text-sm">
+        <thead>
+          <tr>
+            <th class="text-left">Tool</th>
+            <th class="text-right">Calls</th>
+            <th class="text-right">Errors</th>
+            <th class="text-right">Error %</th>
+            <th class="text-right">Avg input</th>
+            <th class="text-right">Avg result</th>
+            <th class="text-right">Sessions</th>
+          </tr>
+        </thead>
+        <tbody id="tools-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════ MODELS TAB ═══════════════════ -->
+<div id="tab-models" class="tab-content hidden p-6 space-y-4">
+  <div class="card p-5">
+    <h3 class="font-semibold text-white mb-4">Cost by Model</h3>
+    <div style="height:220px"><canvas id="chart-model-cost"></canvas></div>
+  </div>
+  <div class="card overflow-hidden">
+    <div class="overflow-auto">
+      <table class="tbl w-full text-sm">
+        <thead>
+          <tr>
+            <th class="text-left">Model</th>
+            <th class="text-right">Calls</th>
+            <th class="text-right">Sessions</th>
+            <th class="text-right">Input</th>
+            <th class="text-right">Output</th>
+            <th class="text-right">Cache W</th>
+            <th class="text-right">Cache R</th>
+            <th class="text-right">Avg out</th>
+            <th class="text-right">Thinking</th>
+            <th class="text-right">Cost</th>
+          </tr>
+        </thead>
+        <tbody id="models-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════ SESSION DETAIL MODAL ═══════════════════ -->
+<div id="modal" class="hidden fixed inset-0 modal-bg z-50 flex items-start justify-center pt-8 px-4 pb-4 overflow-auto">
+  <div class="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-5xl" id="modal-content">
+    <div class="flex items-center justify-between p-5 border-b border-slate-700">
+      <h2 class="font-semibold text-white text-lg" id="modal-title">Session Detail</h2>
+      <button onclick="closeModal()" class="text-slate-400 hover:text-white">
+        <svg class="w-5 h-5" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clip-rule="evenodd"/></svg>
+      </button>
+    </div>
+    <div id="modal-body" class="p-5 space-y-5 overflow-auto max-h-[80vh]"></div>
+  </div>
+</div>
+
+<script>
+// ── Utilities ─────────────────────────────────────────────────────────────────
+const fmtT = n => {
+  n = Math.round(n || 0)
+  if (n >= 1e6) return (n/1e6).toFixed(2) + 'M'
+  if (n >= 1e3) return (n/1e3).toFixed(1) + 'K'
+  return String(n)
+}
+const fmtC = v => '$' + (v || 0).toFixed(4)
+const fmtC2 = v => '$' + (v || 0).toFixed(2)
+const fmtB = b => { b = Math.round(b||0); return b > 1024 ? (b/1024).toFixed(1)+'KB' : b+'B' }
+const fmtDur = s => {
+  if (!s) return '—'
+  s = Math.round(s)
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), ss = s%60
+  if (h) return `${h}h ${m.toString().padStart(2,'0')}m`
+  if (m) return `${m}m ${ss.toString().padStart(2,'0')}s`
+  return `${ss}s`
+}
+const fmtDate = ts => ts ? ts.slice(0,16).replace('T',' ') : '—'
+const esc = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+
+const COLORS = ['#8b5cf6','#06b6d4','#10b981','#f59e0b','#ef4444','#ec4899','#6366f1','#84cc16','#f97316','#14b8a6']
+
+async function api(path) {
+  const r = await fetch(path)
+  return r.json()
+}
+
+// ── Chart instances (to destroy on reload) ────────────────────────────────────
+const charts = {}
+function mkChart(id, cfg) {
+  if (charts[id]) charts[id].destroy()
+  const ctx = document.getElementById(id)
+  if (!ctx) return
+  charts[id] = new Chart(ctx, cfg)
+  return charts[id]
+}
+
+const gridColor = 'rgba(255,255,255,.06)'
+const tickColor = '#64748b'
+const baseFont = { family: 'system-ui', size: 12 }
+
+// ── Navigation ────────────────────────────────────────────────────────────────
+let activeTab = 'overview'
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const tab = btn.dataset.tab
+    document.querySelectorAll('.tab-btn').forEach(b => {
+      b.classList.remove('active')
+      b.classList.add('text-slate-400', 'hover:text-white', 'hover:bg-slate-800')
+      b.classList.remove('text-white')
+    })
+    btn.classList.add('active')
+    btn.classList.remove('text-slate-400', 'hover:text-white', 'hover:bg-slate-800')
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'))
+    document.getElementById('tab-' + tab).classList.remove('hidden')
+    activeTab = tab
+    loadTab(tab)
+  })
+})
+
+function loadTab(tab) {
+  if (tab === 'overview') { loadOverview(); loadDaily(); loadEntrypoints(); }
+  else if (tab === 'sessions') loadSessions()
+  else if (tab === 'projects') loadProjects()
+  else if (tab === 'tools') loadTools()
+  else if (tab === 'models') loadModels()
+}
+
+async function refreshAll() {
+  const icon = document.getElementById('refresh-icon')
+  icon.classList.add('spin')
+  loadTab(activeTab)
+  setTimeout(() => icon.classList.remove('spin'), 1000)
+  document.getElementById('last-updated').textContent = 'Updated ' + new Date().toLocaleTimeString()
+}
+
+// ── Overview ──────────────────────────────────────────────────────────────────
+async function loadOverview() {
+  const d = await api('/api/overview')
+  const periods = [
+    { id: 'card-today', label: 'Today',       accent: '#8b5cf6', data: d.today },
+    { id: 'card-week',  label: 'This Week',   accent: '#06b6d4', data: d.week  },
+    { id: 'card-month', label: 'This Month',  accent: '#10b981', data: d.month },
+    { id: 'card-total', label: 'All Time',    accent: '#f59e0b', data: d.total },
+  ]
+  periods.forEach(({ id, label, accent, data }) => {
+    document.getElementById(id).innerHTML = `
+      <div class="text-xs font-semibold mb-3" style="color:${accent}">${label}</div>
+      <div class="text-2xl font-bold text-white mb-1">${fmtC2(data.cost)}</div>
+      <div class="text-sm text-slate-400 mb-3">${(data.sessions||0)} sessions · ${(data.api_calls||0).toLocaleString()} API calls</div>
+      <div class="grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-slate-500">
+        <span>Input</span><span class="text-slate-300 text-right">${fmtT(data.input_tokens)}</span>
+        <span>Output</span><span class="text-slate-300 text-right">${fmtT(data.output_tokens)}</span>
+        <span>Cache W</span><span class="text-slate-300 text-right">${fmtT(data.cache_write)}</span>
+        <span>Cache R</span><span class="text-slate-300 text-right">${fmtT(data.cache_read)}</span>
+      </div>`
+  })
+}
+
+async function loadDaily() {
+  const days = document.getElementById('daily-range').value
+  const rows = await api(`/api/daily?days=${days}`)
+  const labels = rows.map(r => r.date.slice(5))
+  const costs  = rows.map(r => +(r.total_cost_usd||0).toFixed(4))
+  const inp    = rows.map(r => r.total_input_tokens||0)
+  const out    = rows.map(r => r.total_output_tokens||0)
+  const cr     = rows.map(r => r.total_cache_read_tokens||0)
+
+  mkChart('chart-daily', {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{
+        label: 'Cost (USD)',
+        data: costs,
+        backgroundColor: '#8b5cf680',
+        borderColor: '#8b5cf6',
+        borderWidth: 1,
+        borderRadius: 4,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => ' $' + ctx.raw.toFixed(4) } } },
+      scales: {
+        x: { grid: { color: gridColor }, ticks: { color: tickColor, font: baseFont, maxRotation: 45 } },
+        y: { grid: { color: gridColor }, ticks: { color: tickColor, font: baseFont, callback: v => '$'+v.toFixed(2) } }
+      }
+    }
+  })
+
+  mkChart('chart-tokens', {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        { label: 'Input',    data: inp, backgroundColor: '#6366f180', borderRadius: 2 },
+        { label: 'Output',   data: out, backgroundColor: '#10b98180', borderRadius: 2 },
+        { label: 'Cache R',  data: cr,  backgroundColor: '#f59e0b40', borderRadius: 2 },
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: tickColor, boxWidth: 10, font: baseFont } } },
+      scales: {
+        x: { stacked: true, grid: { color: gridColor }, ticks: { color: tickColor, font: baseFont, maxRotation: 45 } },
+        y: { stacked: true, grid: { color: gridColor }, ticks: { color: tickColor, font: baseFont, callback: v => fmtT(v) } }
+      }
+    }
+  })
+}
+
+async function loadEntrypoints() {
+  const rows = await api('/api/entrypoints')
+  const labels = rows.map(r => r.entrypoint)
+  const vals   = rows.map(r => r.sessions)
+
+  mkChart('chart-entry', {
+    type: 'doughnut',
+    data: {
+      labels,
+      datasets: [{ data: vals, backgroundColor: COLORS, borderWidth: 1, borderColor: '#0f1117' }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { position: 'bottom', labels: { color: '#94a3b8', boxWidth: 12, font: baseFont } },
+        tooltip: { callbacks: { label: ctx => ` ${ctx.label}: ${ctx.raw} sessions` } }
+      }
+    }
+  })
+
+  // Model pie
+  const mrows = await api('/api/models')
+  mkChart('chart-models-pie', {
+    type: 'doughnut',
+    data: {
+      labels: mrows.map(r => r.model.replace('claude-','')),
+      datasets: [{ data: mrows.map(r => +(r.cost||0).toFixed(4)), backgroundColor: COLORS, borderWidth: 1, borderColor: '#0f1117' }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { position: 'bottom', labels: { color: '#94a3b8', boxWidth: 12, font: baseFont } },
+        tooltip: { callbacks: { label: ctx => ` ${ctx.label}: $${ctx.raw}` } }
+      }
+    }
+  })
+}
+
+// ── Sessions ──────────────────────────────────────────────────────────────────
+let sessOffset = 0
+const SESS_LIMIT = 50
+let debTimer = null
+
+function debounceLoadSessions() {
+  clearTimeout(debTimer)
+  debTimer = setTimeout(() => { sessOffset = 0; loadSessions() }, 300)
+}
+
+async function loadSessions() {
+  const project = document.getElementById('filter-project').value
+  const entry   = document.getElementById('filter-entry').value
+  const url = `/api/sessions?limit=${SESS_LIMIT}&offset=${sessOffset}&project=${encodeURIComponent(project)}&entrypoint=${encodeURIComponent(entry)}`
+  const { sessions, total } = await api(url)
+
+  document.getElementById('sessions-count').textContent = `${total} sessions`
+  document.getElementById('page-info').textContent =
+    `${sessOffset+1}–${Math.min(sessOffset+SESS_LIMIT, total)} of ${total}`
+  document.getElementById('prev-page').disabled = sessOffset === 0
+  document.getElementById('next-page').disabled = sessOffset + SESS_LIMIT >= total
+
+  const tbody = document.getElementById('sessions-tbody')
+  tbody.innerHTML = sessions.map(s => {
+    const models = (() => { try { return JSON.parse(s.models_used||'[]') } catch { return [] } })()
+    const modelTag = models.length ? `<span class="badge bg-violet-900/40 text-violet-300">${esc(models[0].replace('claude-',''))}</span>` : ''
+    const entryColor = { cli:'bg-blue-900/40 text-blue-300', 'sdk-ts':'bg-teal-900/40 text-teal-300', 'sdk-python':'bg-green-900/40 text-green-300' }[s.entrypoint] || 'bg-slate-700 text-slate-300'
+    return `<tr class="cursor-pointer" onclick="openSession('${esc(s.session_id)}')">
+      <td class="font-mono text-xs text-slate-400">${s.session_id.slice(0,8)}</td>
+      <td class="text-xs text-slate-300">${fmtDate(s.started_at)}</td>
+      <td class="font-medium text-white max-w-32 truncate">${esc(s.project_slug || s.cwd?.split('/').pop())}</td>
+      <td><span class="badge ${entryColor}">${esc(s.entrypoint||'—')}</span></td>
+      <td class="text-right text-slate-300">${s.total_turns||0}</td>
+      <td class="text-right text-slate-300">${s.total_api_calls||0}</td>
+      <td class="text-right text-slate-300">${s.total_tool_calls||0}</td>
+      <td class="text-right text-slate-300">${fmtT(s.total_input_tokens)}</td>
+      <td class="text-right text-slate-300">${fmtT(s.total_output_tokens)}</td>
+      <td class="text-right font-semibold text-violet-300">${fmtC(s.total_cost_usd)}</td>
+      <td class="text-right text-slate-400 text-xs">${fmtDur(s.duration_seconds)}</td>
+    </tr>`
+  }).join('')
+}
+
+function prevPage() { sessOffset = Math.max(0, sessOffset - SESS_LIMIT); loadSessions() }
+function nextPage() { sessOffset += SESS_LIMIT; loadSessions() }
+
+// ── Projects ──────────────────────────────────────────────────────────────────
+async function loadProjects() {
+  const rows = await api('/api/projects')
+  // bar chart (top 15)
+  const top = rows.slice(0, 15)
+  mkChart('chart-projects', {
+    type: 'bar',
+    data: {
+      labels: top.map(r => r.project?.split('/').pop() || r.cwd?.split('/').pop()),
+      datasets: [{ label: 'Cost (USD)', data: top.map(r => +(r.cost||0).toFixed(4)), backgroundColor: COLORS, borderRadius: 4 }]
+    },
+    options: {
+      indexAxis: 'y',
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => ' $' + ctx.raw } } },
+      scales: {
+        x: { grid: { color: gridColor }, ticks: { color: tickColor, font: baseFont, callback: v => '$'+v.toFixed(2) } },
+        y: { grid: { color: 'transparent' }, ticks: { color: '#e2e8f0', font: baseFont } }
+      }
+    }
+  })
+
+  document.getElementById('projects-tbody').innerHTML = rows.map(r => `
+    <tr>
+      <td class="font-medium text-white max-w-xs truncate" title="${esc(r.cwd)}">${esc(r.project?.split('/').pop() || r.cwd?.split('/').pop())}</td>
+      <td class="text-right text-slate-300">${r.sessions}</td>
+      <td class="text-right text-slate-300">${(r.api_calls||0).toLocaleString()}</td>
+      <td class="text-right text-slate-300">${(r.tool_calls||0).toLocaleString()}</td>
+      <td class="text-right text-slate-300">${fmtT(r.input_tokens)}</td>
+      <td class="text-right text-slate-300">${fmtT(r.output_tokens)}</td>
+      <td class="text-right text-slate-300">${fmtT(r.cache_read)}</td>
+      <td class="text-right font-semibold text-violet-300">${fmtC2(r.cost)}</td>
+      <td class="text-right text-slate-400 text-xs">${fmtDate(r.last_active)}</td>
+    </tr>`).join('')
+}
+
+// ── Tools ─────────────────────────────────────────────────────────────────────
+async function loadTools() {
+  const rows = await api('/api/tools?limit=30')
+  const top15 = rows.slice(0, 15)
+
+  mkChart('chart-tools', {
+    type: 'bar',
+    data: {
+      labels: top15.map(r => r.tool_name),
+      datasets: [{ label: 'Calls', data: top15.map(r => r.total_calls), backgroundColor: COLORS.map(c=>c+'99'), borderColor: COLORS, borderWidth: 1, borderRadius: 4 }]
+    },
+    options: {
+      indexAxis: 'y', responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { grid: { color: gridColor }, ticks: { color: tickColor, font: baseFont } },
+        y: { grid: { color: 'transparent' }, ticks: { color: '#e2e8f0', font: baseFont } }
+      }
+    }
+  })
+
+  const topErr = rows.filter(r => r.errors > 0).slice(0, 15)
+  mkChart('chart-tool-errors', {
+    type: 'bar',
+    data: {
+      labels: topErr.map(r => r.tool_name),
+      datasets: [{ label: 'Error %', data: topErr.map(r => r.error_pct), backgroundColor: '#ef444480', borderColor: '#ef4444', borderWidth: 1, borderRadius: 4 }]
+    },
+    options: {
+      indexAxis: 'y', responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => ` ${ctx.raw}%` } } },
+      scales: {
+        x: { grid: { color: gridColor }, ticks: { color: tickColor, font: baseFont, callback: v => v+'%' } },
+        y: { grid: { color: 'transparent' }, ticks: { color: '#e2e8f0', font: baseFont } }
+      }
+    }
+  })
+
+  document.getElementById('tools-tbody').innerHTML = rows.map(r => `
+    <tr>
+      <td class="font-mono text-sm text-white">${esc(r.tool_name)}</td>
+      <td class="text-right text-slate-300">${(r.total_calls||0).toLocaleString()}</td>
+      <td class="text-right ${r.errors > 0 ? 'text-red-400' : 'text-slate-500'}">${r.errors||0}</td>
+      <td class="text-right ${r.error_pct > 10 ? 'text-red-400' : r.error_pct > 0 ? 'text-yellow-400' : 'text-slate-500'}">${r.error_pct||0}%</td>
+      <td class="text-right text-slate-400 text-xs">${fmtB(r.avg_input_bytes)}</td>
+      <td class="text-right text-slate-400 text-xs">${fmtB(r.avg_result_bytes)}</td>
+      <td class="text-right text-slate-400">${r.sessions}</td>
+    </tr>`).join('')
+}
+
+// ── Models ────────────────────────────────────────────────────────────────────
+async function loadModels() {
+  const rows = await api('/api/models')
+  mkChart('chart-model-cost', {
+    type: 'bar',
+    data: {
+      labels: rows.map(r => r.model.replace('claude-','')),
+      datasets: [{ label: 'Cost (USD)', data: rows.map(r => +(r.cost||0).toFixed(4)), backgroundColor: COLORS, borderRadius: 4 }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => ' $' + ctx.raw } } },
+      scales: {
+        x: { grid: { color: gridColor }, ticks: { color: '#e2e8f0', font: baseFont } },
+        y: { grid: { color: gridColor }, ticks: { color: tickColor, font: baseFont, callback: v => '$'+v.toFixed(2) } }
+      }
+    }
+  })
+
+  document.getElementById('models-tbody').innerHTML = rows.map(r => `
+    <tr>
+      <td class="font-medium text-white max-w-xs">${esc(r.model)}</td>
+      <td class="text-right text-slate-300">${(r.calls||0).toLocaleString()}</td>
+      <td class="text-right text-slate-300">${r.sessions}</td>
+      <td class="text-right text-slate-300">${fmtT(r.input_tokens)}</td>
+      <td class="text-right text-slate-300">${fmtT(r.output_tokens)}</td>
+      <td class="text-right text-slate-300">${fmtT(r.cache_write)}</td>
+      <td class="text-right text-slate-300">${fmtT(r.cache_read)}</td>
+      <td class="text-right text-slate-400">${fmtT(r.avg_output_tokens)}</td>
+      <td class="text-right ${r.thinking_calls > 0 ? 'text-violet-400' : 'text-slate-500'}">${(r.thinking_calls||0).toLocaleString()}</td>
+      <td class="text-right font-semibold text-violet-300">${fmtC2(r.cost)}</td>
+    </tr>`).join('')
+}
+
+// ── Session detail modal ──────────────────────────────────────────────────────
+async function openSession(sid) {
+  document.getElementById('modal').classList.remove('hidden')
+  document.getElementById('modal-body').innerHTML = `<div class="flex justify-center py-12"><svg class="spin w-8 h-8 text-violet-400" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2" opacity=".2"/><path d="M12 2a10 10 0 0110 10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></div>`
+
+  const { session: s, api_calls, tool_summary } = await api(`/api/session/${sid}`)
+  document.getElementById('modal-title').textContent = `Session ${s.session_id.slice(0,8)} — ${s.project_slug || s.cwd?.split('/').pop()}`
+
+  const metaRows = [
+    ['Session ID', `<span class="font-mono text-xs">${s.session_id}</span>`],
+    ['Project', esc(s.project_slug || s.cwd)],
+    ['Entrypoint', s.entrypoint || '—'],
+    ['Branch', s.git_branch || '—'],
+    ['Version', s.claude_version || '—'],
+    ['Started', fmtDate(s.started_at)],
+    ['Duration', fmtDur(s.duration_seconds)],
+    ['Turns', s.total_turns],
+    ['API calls', s.total_api_calls],
+    ['Tool calls', s.total_tool_calls],
+    ['Thinking', s.total_thinking_blocks + ' blocks'],
+    ['Input', fmtT(s.total_input_tokens)],
+    ['Output', fmtT(s.total_output_tokens)],
+    ['Cache write', fmtT(s.total_cache_creation_tokens)],
+    ['Cache read', fmtT(s.total_cache_read_tokens)],
+    ['Cost', `<span class="text-violet-300 font-bold">${fmtC(s.total_cost_usd)}</span>`],
+  ]
+
+  const firstMsg = s.first_user_message
+    ? `<div class="mt-3 text-xs text-slate-400 bg-slate-800/50 rounded-lg p-3 line-clamp-3">${esc(s.first_user_message.slice(0,300))}…</div>` : ''
+
+  document.getElementById('modal-body').innerHTML = `
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-2 text-sm">
+      ${metaRows.map(([k,v]) => `<div class="bg-slate-800/50 rounded-lg p-3"><div class="text-xs text-slate-500 mb-0.5">${k}</div><div class="text-white">${v}</div></div>`).join('')}
+    </div>
+    ${firstMsg}
+
+    ${api_calls.length ? `
+    <div>
+      <h4 class="font-semibold text-white mb-3 text-sm">API Calls (${api_calls.length})</h4>
+      <div class="overflow-auto max-h-64 rounded-lg border border-slate-700">
+        <table class="tbl w-full text-xs">
+          <thead><tr>
+            <th class="text-left">#</th>
+            <th class="text-left">Time</th>
+            <th class="text-left">Model</th>
+            <th class="text-left">Stop</th>
+            <th class="text-right">Input</th>
+            <th class="text-right">Output</th>
+            <th class="text-right">Cache W</th>
+            <th class="text-right">Cache R</th>
+            <th class="text-right">Cost</th>
+            <th class="text-center">Think</th>
+            <th class="text-right">Tools</th>
+          </tr></thead>
+          <tbody>
+            ${api_calls.map(c => `<tr>
+              <td class="text-slate-500">${c.seq_in_session}</td>
+              <td class="text-slate-400 font-mono">${(c.timestamp||'').slice(11,19)}</td>
+              <td class="text-slate-300">${esc((c.model||'').replace('claude-','').slice(0,18))}</td>
+              <td><span class="badge ${c.stop_reason==='tool_use' ? 'bg-blue-900/30 text-blue-300' : c.stop_reason==='end_turn' ? 'bg-green-900/30 text-green-300' : 'bg-slate-700 text-slate-400'}">${c.stop_reason||''}</span></td>
+              <td class="text-right text-slate-300">${fmtT(c.input_tokens)}</td>
+              <td class="text-right text-slate-300">${fmtT(c.output_tokens)}</td>
+              <td class="text-right text-slate-400">${fmtT(c.cache_creation_tokens)}</td>
+              <td class="text-right text-slate-400">${fmtT(c.cache_read_tokens)}</td>
+              <td class="text-right text-violet-300">${fmtC(c.cost_usd)}</td>
+              <td class="text-center">${c.has_thinking ? '🧠' : ''}</td>
+              <td class="text-right text-slate-300">${c.tool_use_count||0}</td>
+            </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>` : ''}
+
+    ${tool_summary.length ? `
+    <div>
+      <h4 class="font-semibold text-white mb-3 text-sm">Tool Calls (${tool_summary.reduce((a,t)=>a+(t.calls||0),0)})</h4>
+      <div class="overflow-auto max-h-48 rounded-lg border border-slate-700">
+        <table class="tbl w-full text-xs">
+          <thead><tr>
+            <th class="text-left">Tool</th>
+            <th class="text-right">Calls</th>
+            <th class="text-right">Errors</th>
+            <th class="text-right">Avg result</th>
+          </tr></thead>
+          <tbody>
+            ${tool_summary.map(t => `<tr>
+              <td class="font-mono text-white">${esc(t.tool_name)}</td>
+              <td class="text-right text-slate-300">${t.calls}</td>
+              <td class="text-right ${t.errors > 0 ? 'text-red-400' : 'text-slate-500'}">${t.errors}</td>
+              <td class="text-right text-slate-400">${fmtB(t.avg_result_bytes)}</td>
+            </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>` : ''}
+  `
+}
+
+function closeModal() {
+  document.getElementById('modal').classList.add('hidden')
+}
+document.getElementById('modal').addEventListener('click', e => {
+  if (e.target === document.getElementById('modal')) closeModal()
+})
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal() })
+
+// ── Filter init ───────────────────────────────────────────────────────────────
+async function initFilters() {
+  const { entrypoints } = await api('/api/filters')
+  const sel = document.getElementById('filter-entry')
+  entrypoints.forEach(e => {
+    const o = document.createElement('option')
+    o.value = e; o.textContent = e
+    sel.appendChild(o)
+  })
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+initFilters()
+loadOverview()
+loadDaily()
+loadEntrypoints()
+document.getElementById('last-updated').textContent = 'Updated ' + new Date().toLocaleTimeString()
+</script>
+</body>
+</html>
