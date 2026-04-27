@@ -4,6 +4,18 @@ Tracks token usage and cost for every Claude Code session, stores it in a local 
 
 ![Dashboard](https://p.ipic.vip/9yxdya.png)
 
+## Screenshots
+
+| Overview | Sessions |
+|----------|----------|
+| ![Overview](static/images/claude-token-tracker-overview-1.png) | ![Sessions](static/images/claude-token-tracker-sessions-2.png) |
+
+| Projects | Tools |
+|----------|-------|
+| ![Projects](static/images/claude-token-tracker-projects-3.png) | ![Tools](static/images/claude-token-tracker-tools-4.png) |
+
+![Models](static/images/claude-token-tracker-models-5.png)
+
 ## Prerequisites
 
 - [Claude Code](https://claude.ai/code) installed and configured
