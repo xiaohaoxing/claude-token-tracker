@@ -11,7 +11,7 @@ Tracks token usage and cost for every Claude Code session, stores it in a local 
 ## Install
 
 ```bash
-git clone https://github.com/yourname/claude-token-tracker
+git clone https://github.com/xiaohaoxing/claude-token-tracker
 cd claude-token-tracker
 chmod +x install.sh
 ./install.sh
