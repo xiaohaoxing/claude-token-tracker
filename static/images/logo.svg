@@ -1,0 +1,18 @@
+<svg width="200" height="200" viewBox="0 0 200 200" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- 背景：圆角矩形 -->
+  <rect width="200" height="200" rx="40" fill="#1A1A1A"/>
+  
+  <!-- 终端提示符 (>) -->
+  <path d="M50 70L75 95L50 120" stroke="#F5F2ED" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+  
+  <!-- 统计柱状图 -->
+  <!-- 第一根柱子 -->
+  <rect x="95" y="110" width="16" height="25" rx="4" fill="#F5F2ED"/>
+  <!-- 第二根柱子 (最高，代表核心数据) -->
+  <rect x="125" y="75" width="16" height="60" rx="4" fill="#F5F2ED"/>
+  <!-- 第三根柱子 -->
+  <rect x="155" y="95" width="16" height="40" rx="4" fill="#F5F2ED"/>
+  
+  <!-- 底部装饰线 (模拟终端光标) -->
+  <line x1="50" y1="145" x2="80" y2="145" stroke="#F5F2ED" stroke-width="8" stroke-linecap="round"/>
+</svg>
