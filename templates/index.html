@@ -397,16 +397,13 @@ async function loadDaily() {
     },
     options: {
       responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
       plugins: {
         legend: { labels: { color: tickColor, boxWidth: 10, font: baseFont } },
         tooltip: {
-          mode: 'index',
           callbacks: {
             label: ctx => ` ${ctx.dataset.label}: ${fmtT(ctx.raw)}`,
-            footer: items => {
-              const total = items.reduce((s, i) => s + i.raw, 0)
-              return `Total: ${fmtT(total)}`
-            }
+            footer: items => `Total: ${fmtT(items.reduce((s, i) => s + i.raw, 0))}`
           }
         }
       },
