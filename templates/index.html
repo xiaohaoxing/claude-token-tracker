@@ -109,6 +109,7 @@ tailwind.config = {
 <!-- ═══════════════════ SESSIONS TAB ═══════════════════ -->
 <div id="tab-sessions" class="tab-content hidden p-6 space-y-4">
   <div class="flex items-center gap-3 flex-wrap">
+    <input id="filter-search" placeholder="Search sessions…" class="w-56" oninput="debounceLoadSessions()" />
     <input id="filter-project" placeholder="Filter by project…" class="w-48" oninput="debounceLoadSessions()" />
     <select id="filter-entry" onchange="loadSessions()">
       <option value="">All entrypoints</option>
@@ -467,7 +468,8 @@ async function loadSessions() {
   const project = document.getElementById('filter-project').value
   const entry   = document.getElementById('filter-entry').value
   const imOnly  = document.getElementById('filter-im-only').checked ? '1' : ''
-  const url = `/api/sessions?limit=${SESS_LIMIT}&offset=${sessOffset}&project=${encodeURIComponent(project)}&entrypoint=${encodeURIComponent(entry)}&im_only=${imOnly}`
+  const q       = document.getElementById('filter-search').value
+  const url = `/api/sessions?limit=${SESS_LIMIT}&offset=${sessOffset}&project=${encodeURIComponent(project)}&entrypoint=${encodeURIComponent(entry)}&im_only=${imOnly}&q=${encodeURIComponent(q)}`
   const { sessions, total } = await api(url)
 
   document.getElementById('sessions-count').textContent = `${total} sessions`

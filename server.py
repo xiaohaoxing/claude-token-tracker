@@ -101,6 +101,7 @@ def sessions():
     project = request.args.get("project", "").strip()
     entry   = request.args.get("entrypoint", "").strip()
     im_only = request.args.get("im_only", "").strip()
+    q       = request.args.get("q", "").strip()          # ← 新增搜索关键词
 
     clauses, params = [], []
     if project:
@@ -111,6 +112,20 @@ def sessions():
         params.append(entry)
     if im_only == "1":
         clauses.append("im_source IS NOT NULL")
+    if q:
+        # 跨字段模糊搜索
+        search_clause = """(
+            session_id         LIKE ?
+            OR project_slug   LIKE ?
+            OR cwd             LIKE ?
+            OR first_user_message LIKE ?
+            OR git_branch      LIKE ?
+            OR entrypoint      LIKE ?
+            OR im_source       LIKE ?
+        )"""
+        clauses.append(search_clause)
+        q_pattern = f"%{q}%"
+        params.extend([q_pattern] * 7)
 
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
