@@ -216,6 +216,24 @@ CREATE INDEX IF NOT EXISTS idx_sessions_entrypoint ON sessions(entrypoint);
 """
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
+def ensure_schema(con: sqlite3.Connection) -> None:
+    """
+    Create missing tables/indexes and apply column migrations.
+
+    Any entry point (Stop hook, CLI, dashboard) can be the first thing to run
+    after an upgrade, so every one of them must be able to bring an older
+    database up to date on its own. Otherwise the dashboard 500s on a column the
+    new queries expect but the old database does not have yet.
+    """
+    con.executescript(SCHEMA)
+    cols = {r[1] for r in con.execute("PRAGMA table_info(sessions)")}
+    if "im_source" not in cols:
+        con.execute("ALTER TABLE sessions ADD COLUMN im_source TEXT")
+    if "session_name" not in cols:
+        con.execute("ALTER TABLE sessions ADD COLUMN session_name TEXT")
+    con.commit()
+
+
 def open_db() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     # The hook, the CLI and the dashboard can all write at the same time now, so
@@ -223,14 +241,7 @@ def open_db() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH, timeout=15)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA busy_timeout = 15000")
-    con.executescript(SCHEMA)
-    # Migrate: add im_source if this is an existing DB without it
-    cols = {r[1] for r in con.execute("PRAGMA table_info(sessions)")}
-    if "im_source" not in cols:
-        con.execute("ALTER TABLE sessions ADD COLUMN im_source TEXT")
-    if "session_name" not in cols:
-        con.execute("ALTER TABLE sessions ADD COLUMN session_name TEXT")
-    con.commit()
+    ensure_schema(con)
     return con
 
 

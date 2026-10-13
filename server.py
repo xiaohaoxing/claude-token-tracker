@@ -6,6 +6,7 @@ Run: python3 server.py  (default port 5000)
 
 import json
 import os
+import socket
 import sqlite3
 import threading
 import time
@@ -30,9 +31,22 @@ app.config["TEMPLATES_AUTO_RELOAD"] = True
 
 
 # ── DB helper ────────────────────────────────────────────────────────────────
+# Columns the queries below rely on. If any is missing, the database was written
+# by an older version of the tracker — migrate it before serving instead of
+# returning a 500 on the first page load.
+_REQUIRED_SESSION_COLS = {"session_id", "im_source", "session_name", "transcript_path"}
+
+
 def get_db() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=15)
     con.row_factory = sqlite3.Row
+    con.execute("PRAGMA busy_timeout = 15000")
+    try:
+        cols = {r[1] for r in con.execute("PRAGMA table_info(sessions)")}
+    except sqlite3.DatabaseError:
+        cols = set()
+    if not _REQUIRED_SESSION_COLS <= cols:
+        tracker.ensure_schema(con)
     return con
 
 
@@ -330,16 +344,43 @@ def start_catchup_thread() -> None:
     print(f"  catch-up : every {int(CATCHUP_EVERY)}s")
 
 
+def _lan_ip() -> str:
+    """
+    Best-effort LAN address. Resolving our own hostname returns 127.0.0.1 on
+    plenty of machines, which makes the "open this from another device" line
+    useless, so ask the routing table which local address would be used.
+    """
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))      # UDP connect sends no packets
+            ip = s.getsockname()[0]
+        finally:
+            s.close()
+        if ip and ip != "0.0.0.0" and not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+    try:
+        return socket.gethostbyname(socket.gethostname())
+    except Exception:
+        return "0.0.0.0"
+
+
 if __name__ == "__main__":
-    import socket
     import sys
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 5001
-    try:
-        lan_ip = socket.gethostbyname(socket.gethostname())
-    except Exception:
-        lan_ip = "0.0.0.0"
+    lan_ip = _lan_ip()
     print(f"Claude Usage Dashboard")
     print(f"  Local  → http://localhost:{port}")
     print(f"  LAN    → http://{lan_ip}:{port}")
+    # Bring an older database up to date now, so a schema problem shows up here
+    # rather than as a 500 on the first page load.
+    try:
+        _con = get_db()
+        _con.close()
+        print("  DB     → schema up to date")
+    except Exception as e:
+        print(f"  DB     → WARNING: {e}")
     start_catchup_thread()
     app.run(host="0.0.0.0", port=port, debug=False)

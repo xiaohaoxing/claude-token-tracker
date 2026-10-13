@@ -16,6 +16,10 @@ Usage:
     stats.py daily [--days N]        – daily chart (last N days)
 """
 
+# Lazy annotations, so this also runs on interpreters without PEP 604 unions
+# (`X | Y`) such as the Python 3.9 shipped with macOS.
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -23,6 +27,8 @@ import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import tracker  # same directory — shared schema/migration handling
 
 DB_PATH = Path(os.environ.get("CLAUDE_TRACKER_DB",
                Path.home() / ".claude" / "token-tracker" / "token_stats.db"))
@@ -32,8 +38,11 @@ def open_db() -> sqlite3.Connection:
     if not DB_PATH.exists():
         print(f"Database not found at {DB_PATH}. Run tracker.py --backfill first.", file=sys.stderr)
         sys.exit(1)
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=15)
     con.row_factory = sqlite3.Row
+    con.execute("PRAGMA busy_timeout = 15000")
+    # Bring an older database up to date, exactly like the hook and the dashboard.
+    tracker.ensure_schema(con)
     return con
 
 
