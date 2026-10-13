@@ -44,6 +44,18 @@ chmod +x install.sh
 
 安装完成后，新会话会自动被追踪，无需手动操作。
 
+安装脚本支持以下选项：
+
+| 选项 | 作用 |
+|------|------|
+| `--start` | 直接在后台启动看板，不再询问 |
+| `--no-start` | 从不启动（脚本化 / CI 安装） |
+| `--port N` | 看板端口（默认 5001，也可用 `CLAUDE_TRACKER_PORT`） |
+
+安装结束时会打印看板地址、当前是否已在运行；在交互式终端里还会询问是否
+直接帮你启动。后台启动的看板日志在 `~/.claude/token-tracker/dashboard.log`，
+PID 写在 `~/.claude/token-tracker/dashboard.pid`。
+
 ## 升级
 
 已经装过了？升级只有一条命令：

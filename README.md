@@ -45,6 +45,19 @@ package managers.
 
 After install, new sessions are tracked automatically — no manual steps needed.
 
+The installer accepts a few options:
+
+| Option | Effect |
+|--------|--------|
+| `--start` | start the dashboard in the background without asking |
+| `--no-start` | never start it (scripted / CI installs) |
+| `--port N` | dashboard port (default 5001, or `CLAUDE_TRACKER_PORT`) |
+
+When it finishes it prints the dashboard URL, says whether it is already
+running, and — in an interactive terminal — offers to start it for you. A
+background dashboard logs to `~/.claude/token-tracker/dashboard.log` and writes
+its PID to `~/.claude/token-tracker/dashboard.pid`.
+
 ## Upgrade
 
 Already installed? Upgrading is one command:

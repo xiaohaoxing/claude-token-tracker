@@ -6,10 +6,50 @@ SETTINGS="$HOME/.claude/settings.json"
 TRACKER="$REPO_DIR/tracker.py"
 LAUNCHER="$REPO_DIR/hook.sh"
 DB_PATH="$HOME/.claude/token-tracker/token_stats.db"
+PID_FILE="$HOME/.claude/token-tracker/dashboard.pid"
+LOG_FILE="$HOME/.claude/token-tracker/dashboard.log"
+
+# ── Options ───────────────────────────────────────────────────────────────────
+START_MODE="ask"                                  # ask | always | never
+PORT="${CLAUDE_TRACKER_PORT:-5001}"
+
+usage() {
+  cat <<'EOF'
+Usage: ./install.sh [options]
+
+  --start        start the dashboard in the background without asking
+  --no-start     never start it (scripted / CI installs)
+  --port N       dashboard port (default 5001)
+  -h, --help     show this help
+
+Environment:
+  CLAUDE_TRACKER_PORT   same as --port
+  CLAUDE_TRACKER_DB     database path (default ~/.claude/token-tracker/token_stats.db)
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --start)    START_MODE="always" ;;
+    --no-start) START_MODE="never" ;;
+    --port)     PORT="${2:-}"; shift ;;
+    --port=*)   PORT="${1#*=}" ;;
+    -h|--help)  usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+case "$PORT" in
+  ''|*[!0-9]*) echo "Invalid port: ${PORT}" >&2; exit 2 ;;
+esac
+
+DASH_URL="http://localhost:${PORT}"
 
 echo "Claude Token Tracker — install"
 echo "  Repo    : $REPO_DIR"
 echo "  DB      : $DB_PATH"
+echo "  Port    : $PORT"
 echo ""
 
 # ── Locate a usable Python 3 ──────────────────────────────────────────────────
@@ -128,10 +168,49 @@ else
   echo "  No ~/.claude/projects/ found, skipping backfill."
 fi
 
-# ── Done ──────────────────────────────────────────────────────────────────────
-# Keep in sync with the default port in server.py.
-PORT=5001
-DASH_URL="http://localhost:${PORT}"
+# ── Dashboard ─────────────────────────────────────────────────────────────────
+dashboard_up() {
+  command -v curl >/dev/null 2>&1 || return 1
+  curl -s -m 2 "${DASH_URL}/" 2>/dev/null | grep -q "Claude Usage Dashboard"
+}
+
+# Is *anything* already answering on that port? (not necessarily our dashboard)
+port_responds() {
+  command -v curl >/dev/null 2>&1 || return 1
+  curl -s -o /dev/null -m 2 "${DASH_URL}/" 2>/dev/null
+}
+
+start_dashboard() {
+  mkdir -p "$(dirname "$LOG_FILE")"
+  : > "$LOG_FILE"
+  nohup "$PY" "$REPO_DIR/server.py" "$PORT" >>"$LOG_FILE" 2>&1 </dev/null &
+  _pid=$!
+  echo "$_pid" > "$PID_FILE"
+  disown 2>/dev/null || true
+
+  printf "  Starting the dashboard"
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 1
+    printf "."
+    if dashboard_up; then
+      echo ""
+      echo "  ✓ Up — open ${DASH_URL}"
+      _lan=$(grep -m1 'LAN' "$LOG_FILE" 2>/dev/null | sed 's/.*→ *//')
+      case "${_lan:-}" in
+        ""|*127.0.0.1*|*0.0.0.0*) ;;          # not reachable from other devices
+        *) echo "  ✓ From another device: ${_lan}" ;;
+      esac
+      echo "    Stop it with: kill \$(cat $PID_FILE)"
+      return 0
+    fi
+    kill -0 "$_pid" 2>/dev/null || break
+  done
+  sleep 1                                      # let the child flush its log
+  echo ""
+  echo "  ✗ The dashboard did not come up. Last lines of $LOG_FILE:"
+  tail -n 10 "$LOG_FILE" 2>/dev/null | sed 's/^/      /' || true
+  return 1
+}
 
 echo ""
 echo "✓ Install complete!"
@@ -141,25 +220,50 @@ echo "     ${DASH_URL}"
 echo "  ───────────────────────────────────────────────────────────"
 echo ""
 
-if command -v curl >/dev/null 2>&1 \
-   && curl -s -m 2 "${DASH_URL}/" 2>/dev/null | grep -q "Claude Usage Dashboard"; then
+if dashboard_up; then
   echo "  It is already running — open ${DASH_URL} (refresh to see new data)."
-else
-  echo "  It is not running yet. Start it with:"
+
+elif [ "$START_MODE" = "never" ]; then
+  echo "  Start it with:"
   echo ""
-  echo "      $PY $REPO_DIR/server.py"
+  echo "      $PY $REPO_DIR/server.py $PORT"
   echo ""
   echo "  then open ${DASH_URL}"
+
+elif port_responds; then
+  echo "  ✗ Port ${PORT} is already in use by another application — nothing was started."
+  echo "    Use a different port, e.g.:  ./install.sh --start --port 8080"
+
+else
+  _do_start="no"
+  if [ "$START_MODE" = "always" ]; then
+    _do_start="yes"
+  elif [ -t 0 ]; then
+    printf "  Start the dashboard now in the background (port %s)? [Y/n] " "$PORT"
+    if read -r _answer; then
+      case "$_answer" in
+        [nN]*) _do_start="no" ;;
+        *)     _do_start="yes" ;;
+      esac
+    fi
+    echo ""
+  fi
+
+  if [ "$_do_start" = "yes" ]; then
+    start_dashboard || true
+  else
+    echo "  Start it with:"
+    echo ""
+    echo "      $PY $REPO_DIR/server.py $PORT"
+    echo ""
+    echo "  then open ${DASH_URL}"
+  fi
 fi
 
 echo ""
 echo "  Stats CLI       : $PY $REPO_DIR/stats.py today"
-echo "  Custom port     : $PY $REPO_DIR/server.py 8080"
 echo "  Backfill again  : $PY $REPO_DIR/tracker.py --backfill ~/.claude/projects/"
 echo "  Catch up now    : $PY $REPO_DIR/tracker.py --catch-up"
-echo ""
-echo "  From another device on the same network: http://<this-machine-ip>:${PORT}"
-echo "  (server.py prints the exact LAN address when it starts)"
 echo ""
 echo "  Missed sessions are re-scanned automatically: after every tracked turn"
 echo "  and every 5 minutes while the dashboard is running."
