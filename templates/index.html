@@ -127,6 +127,7 @@ tailwind.config = {
         <thead>
           <tr>
             <th class="text-left">Session</th>
+            <th class="text-left">Name</th>
             <th class="text-left">Started</th>
             <th class="text-left">Project</th>
             <th class="text-left">Via</th>
@@ -486,6 +487,7 @@ async function loadSessions() {
     const imBadge = s.im_source ? `<span class="badge bg-fuchsia-900/40 text-fuchsia-300 ml-1">IM</span>` : ''
     return `<tr class="cursor-pointer" onclick="openSession('${esc(s.session_id)}')">
       <td class="font-mono text-xs text-slate-400">${s.session_id.slice(0,8)}</td>
+      <td class="text-xs text-white max-w-32 truncate">${esc(s.session_name || '—')}</td>
       <td class="text-xs text-slate-300">${fmtDate(s.started_at)}</td>
       <td class="font-medium text-white max-w-32 truncate">${esc(s.project_slug || s.cwd?.split('/').pop())}</td>
       <td><span class="badge ${entryColor}">${esc(s.entrypoint||'—')}</span>${imBadge}</td>
@@ -629,10 +631,11 @@ async function openSession(sid) {
   document.getElementById('modal-body').innerHTML = `<div class="flex justify-center py-12"><svg class="spin w-8 h-8 text-violet-400" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2" opacity=".2"/><path d="M12 2a10 10 0 0110 10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></div>`
 
   const { session: s, api_calls, tool_summary } = await api(`/api/session/${sid}`)
-  document.getElementById('modal-title').textContent = `Session ${s.session_id.slice(0,8)} — ${s.project_slug || s.cwd?.split('/').pop()}`
+  document.getElementById('modal-title').textContent = `${s.session_name ? s.session_name : 'Session ' + s.session_id.slice(0,8)} — ${s.project_slug || s.cwd?.split('/').pop()}`
 
   const metaRows = [
     ['Session ID', `<span class="font-mono text-xs">${s.session_id}</span>`],
+    ['Session Name', esc(s.session_name || '—')],
     ['Project', esc(s.project_slug || s.cwd)],
     ['Entrypoint', s.entrypoint || '—'],
     ['Branch', s.git_branch || '—'],

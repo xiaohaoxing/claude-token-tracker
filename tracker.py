@@ -10,6 +10,7 @@ Usage (backfill):   python3 tracker.py --backfill <projects_dir>
 import argparse
 import json
 import os
+import re
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -79,6 +80,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     first_user_message    TEXT,   -- first 500 chars of first human turn
     transcript_path       TEXT,
     im_source             TEXT,   -- 'cti' if launched via claude-to-im, else NULL
+    session_name          TEXT,   -- user-renamed session name via /rename
 
     created_at  TEXT DEFAULT (datetime('now')),
     updated_at  TEXT DEFAULT (datetime('now'))
@@ -174,6 +176,8 @@ def open_db() -> sqlite3.Connection:
     cols = {r[1] for r in con.execute("PRAGMA table_info(sessions)")}
     if "im_source" not in cols:
         con.execute("ALTER TABLE sessions ADD COLUMN im_source TEXT")
+    if "session_name" not in cols:
+        con.execute("ALTER TABLE sessions ADD COLUMN session_name TEXT")
     con.commit()
     return con
 
@@ -245,6 +249,17 @@ def parse_transcript(path: str) -> dict:
                     break
             if first_user_message:
                 break
+
+    # Extract session name from /rename command
+    session_name = None
+    for m in messages:
+        if m.get("type") == "system" and m.get("subtype") == "local_command":
+            msg_content = m.get("content", "")
+            if "/rename" in msg_content:
+                match = re.search(r'<command-args>(.*?)</command-args>', msg_content, re.DOTALL)
+                if match:
+                    session_name = match.group(1).strip()
+                    break
 
     # ── Build api_call records ────────────────────────────────────────────────
     api_call_records: list[dict] = []
@@ -394,6 +409,7 @@ def parse_transcript(path: str) -> dict:
         "first_user_message":          first_user_message,
         "transcript_path":             path,
         "im_source":                   None,  # filled in by run_hook() when CTI_RUNTIME is set
+        "session_name":                session_name,
     }
 
     return {"session_meta": session_meta, "api_calls": api_call_records, "tool_calls": tool_call_records}
@@ -408,7 +424,7 @@ def upsert_session(con: sqlite3.Connection, meta: dict) -> None:
             total_cache_read_tokens, total_cache_1h_tokens, total_cache_5m_tokens,
             total_cost_usd, total_turns, total_api_calls, total_tool_calls,
             total_thinking_blocks, total_output_chars,
-            models_used, first_user_message, transcript_path, im_source, updated_at
+            models_used, first_user_message, transcript_path, im_source, session_name, updated_at
         ) VALUES (
             :session_id, :started_at, :ended_at, :duration_seconds,
             :cwd, :project_slug, :entrypoint, :git_branch, :claude_version, :user_type,
@@ -416,7 +432,7 @@ def upsert_session(con: sqlite3.Connection, meta: dict) -> None:
             :total_cache_read_tokens, :total_cache_1h_tokens, :total_cache_5m_tokens,
             :total_cost_usd, :total_turns, :total_api_calls, :total_tool_calls,
             :total_thinking_blocks, :total_output_chars,
-            :models_used, :first_user_message, :transcript_path, :im_source, datetime('now')
+            :models_used, :first_user_message, :transcript_path, :im_source, :session_name, datetime('now')
         )
         ON CONFLICT(session_id) DO UPDATE SET
             ended_at                    = excluded.ended_at,
@@ -436,6 +452,7 @@ def upsert_session(con: sqlite3.Connection, meta: dict) -> None:
             models_used                 = excluded.models_used,
             transcript_path             = excluded.transcript_path,
             im_source                   = COALESCE(excluded.im_source, sessions.im_source),
+            session_name                = COALESCE(excluded.session_name, sessions.session_name),
             updated_at                  = datetime('now')
     """, meta)
 

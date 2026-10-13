@@ -137,7 +137,7 @@ def sessions():
                total_cache_creation_tokens, total_cache_read_tokens,
                total_cost_usd, total_turns, total_api_calls, total_tool_calls,
                total_thinking_blocks, duration_seconds,
-               models_used, first_user_message, im_source
+               models_used, first_user_message, im_source, session_name
         FROM sessions {where}
         ORDER BY started_at DESC
         LIMIT ? OFFSET ?
