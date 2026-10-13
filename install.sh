@@ -129,13 +129,37 @@ else
 fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
+# Keep in sync with the default port in server.py.
+PORT=5001
+DASH_URL="http://localhost:${PORT}"
+
 echo ""
 echo "✓ Install complete!"
 echo ""
-echo "  Start dashboard : $PY $REPO_DIR/server.py"
-echo "  Query stats CLI : $PY $REPO_DIR/stats.py today"
+echo "  ── Dashboard ──────────────────────────────────────────────"
+echo "     ${DASH_URL}"
+echo "  ───────────────────────────────────────────────────────────"
+echo ""
+
+if command -v curl >/dev/null 2>&1 \
+   && curl -s -m 2 "${DASH_URL}/" 2>/dev/null | grep -q "Claude Usage Dashboard"; then
+  echo "  It is already running — open ${DASH_URL} (refresh to see new data)."
+else
+  echo "  It is not running yet. Start it with:"
+  echo ""
+  echo "      $PY $REPO_DIR/server.py"
+  echo ""
+  echo "  then open ${DASH_URL}"
+fi
+
+echo ""
+echo "  Stats CLI       : $PY $REPO_DIR/stats.py today"
+echo "  Custom port     : $PY $REPO_DIR/server.py 8080"
 echo "  Backfill again  : $PY $REPO_DIR/tracker.py --backfill ~/.claude/projects/"
 echo "  Catch up now    : $PY $REPO_DIR/tracker.py --catch-up"
+echo ""
+echo "  From another device on the same network: http://<this-machine-ip>:${PORT}"
+echo "  (server.py prints the exact LAN address when it starts)"
 echo ""
 echo "  Missed sessions are re-scanned automatically: after every tracked turn"
 echo "  and every 5 minutes while the dashboard is running."
