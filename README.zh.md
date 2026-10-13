@@ -21,7 +21,8 @@
 ## 前置条件
 
 - 已安装并配置 [Claude Code](https://claude.ai/code)
-- Python 3.9+
+- Python 3.7+ —— 不写死任何解释器路径：hook 启动器在运行时从 `PATH` 中挑一个
+  可用的解释器，找不到会明确报错
 - Flask：`pip3 install flask`
 
 ## 安装
@@ -34,11 +35,47 @@ chmod +x install.sh
 ```
 
 安装脚本会：
-1. 检查 Python 和 Flask 是否可用
+1. 在 `PATH` 中找到一个可用的 Python 3，并检查/安装 Flask
 2. 在 `~/.claude/settings.json` 中注册一个 **Stop hook**，每次 Claude Code 会话结束后自动触发
 3. 将 `~/.claude/projects/` 中已有的历史会话一次性导入数据库
 
+注册的命令是一个便携启动器（`hook.sh`），而不是写死的解释器路径，
+因此在换机器、升级 Python、切换包管理器后依然可用。
+
 安装完成后，新会话会自动被追踪，无需手动操作。
+
+## 升级
+
+已经装过了？升级只有一条命令：
+
+```bash
+cd claude-token-tracker
+git pull
+./install.sh
+```
+
+安装脚本可以反复执行，会自动完成所有事情：
+
+1. 把 hook 注册迁移到当前的便携启动器（`python3 …/tracker.py` → `sh …/hook.sh`），
+   并移除旧条目 —— 移除内容会打印出来，不会静默改动你的配置
+2. 重新探测可用的 Python 3
+3. 重新读取 `~/.claude/projects/` 下的全部 transcript。这同时会**修复历史会话**：
+   旧版本会把一个会话的 token 统计成约 2 倍，重新导入会重新计算
+
+不需要手工迁移任何东西 —— 新增的数据库表会在工具（hook / 命令行 / 看板）
+第一次运行时自动创建。
+
+注意事项：
+
+- 本地有未提交改动？先 `git stash && git pull && ./install.sh`
+- 不是 `git clone` 而是下载 ZIP 安装的？下载新 ZIP 后在新目录里执行
+  `./install.sh` —— 即使路径变了，旧 hook 也会被移除
+- 升级后可以这样确认：
+
+```bash
+python3 tracker.py --catch-up   # 输出这次补进来的会话数
+python3 stats.py today          # 查看今天的用量
+```
 
 ## 启动 Web 看板
 
@@ -61,13 +98,23 @@ python3 server.py 8080     # 自定义端口
 
 ## 新会话什么时候出现？
 
-数据通过 **Stop hook** 写入，即每次 Claude Code 完成一条响应后触发。因此，正在进行中的会话最后几轮可能还未入库，可以手动触发补录：
+数据通过 **Stop hook** 写入，即每次 Claude Code 完成一条响应后触发。
+
+由于 hook 是"尽力而为"的（headless/SDK 会话可能根本不触发它，而且它可能在
+本轮 transcript 落盘之前就执行了），追踪器还有一个 **catch-up 兜底**：重新扫描
+`~/.claude/projects/`，把新增或有变化的 transcript 补进来：
+
+- 每次被追踪的对话轮结束后（有节流，最快约 1 分钟一次）
+- 看板服务运行期间每 5 分钟一次
+- 也可以手动触发：
 
 ```bash
-python3 tracker.py --backfill ~/.claude/projects/
+python3 tracker.py --catch-up                     # 只处理新增/变化的文件
+python3 tracker.py --backfill ~/.claude/projects/ # 全量重读
 ```
 
-该命令使用 upsert，重复执行不会产生重复数据。
+两者都可重复执行（upsert + `INSERT OR IGNORE`），不会产生重复数据。
+如需在看板运行期间关闭兜底，可设置 `CLAUDE_TRACKER_NO_CATCHUP=1`。
 
 ## IM 会话标记
 
@@ -115,7 +162,8 @@ CLAUDE_TRACKER_DB=/path/to/custom.db python3 server.py
 
 ```
 claude-token-tracker/
-├── tracker.py        # Stop hook 脚本 + 历史补录模式
+├── tracker.py        # Stop hook 脚本 + 历史补录 / catch-up 兜底
+├── hook.sh           # Stop hook 实际执行的便携启动器
 ├── stats.py          # 命令行查询工具
 ├── server.py         # Flask Web 看板
 ├── templates/

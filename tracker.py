@@ -5,7 +5,13 @@ Parses session JSONL files and persists token usage to SQLite.
 
 Usage (Stop hook):  stdin JSON → { session_id, transcript_path, cwd }
 Usage (backfill):   python3 tracker.py --backfill <projects_dir>
+Usage (catch-up):   python3 tracker.py --catch-up
 """
+
+# Keep annotations lazy so this file also runs on interpreters that predate
+# PEP 604 unions (`X | Y` in annotations) — e.g. the Python 3.9 that macOS
+# ships at /usr/bin/python3, which used to crash this file on import.
+from __future__ import annotations
 
 import argparse
 import json
@@ -13,11 +19,39 @@ import os
 import re
 import sqlite3
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+# ── Interpreter guard ─────────────────────────────────────────────────────────
+# The Stop hook runs whatever `python3` resolves to on the user's PATH, and that
+# differs from machine to machine. Never die with an obscure SyntaxError or
+# TypeError: explain the problem and exit non-zero, because a non-zero hook exit
+# code is what Claude Code surfaces back to the user.
+MIN_PYTHON = (3, 7)
+
+if sys.version_info < MIN_PYTHON:
+    sys.stderr.write(
+        "claude-token-tracker: unsupported interpreter "
+        "Python {}.{}.{} ({})\n"
+        "  Python {}.{}+ is required. Install a newer Python 3, make sure\n"
+        "  `python3` on PATH resolves to it, then re-run ./install.sh\n"
+        "  Usage is NOT being tracked until this is fixed.\n".format(
+            sys.version_info[0], sys.version_info[1], sys.version_info[2],
+            sys.executable, MIN_PYTHON[0], MIN_PYTHON[1],
+        )
+    )
+    sys.exit(1)
+
 DB_PATH = Path(os.environ.get("CLAUDE_TRACKER_DB",
                Path.home() / ".claude" / "token-tracker" / "token_stats.db"))
+
+# Where Claude Code keeps its session transcripts (overridable for tests).
+PROJECTS_DIR = Path(os.environ.get("CLAUDE_TRACKER_PROJECTS",
+                  Path.home() / ".claude" / "projects"))
+
+# Minimum seconds between two automatic catch-up scans (0 = every hook run).
+CATCHUP_INTERVAL = float(os.environ.get("CLAUDE_TRACKER_CATCHUP_INTERVAL", "60"))
 
 # ── Pricing table (USD per 1M tokens) ────────────────────────────────────────
 PRICING: dict[str, dict[str, float]] = {
@@ -156,6 +190,21 @@ CREATE TABLE IF NOT EXISTS daily_summary (
     updated_at TEXT DEFAULT (datetime('now'))
 );
 
+-- Bookkeeping for the catch-up safety net: which transcript files have already
+-- been ingested, and at what (mtime, size). Lets catch-up skip unchanged files
+-- so it stays cheap enough to run from a hook or from the dashboard.
+CREATE TABLE IF NOT EXISTS ingest_state (
+    path        TEXT PRIMARY KEY,
+    mtime       REAL,
+    size        INTEGER,
+    ingested_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS tracker_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_api_calls_session   ON api_calls(session_id);
 CREATE INDEX IF NOT EXISTS idx_api_calls_timestamp ON api_calls(timestamp);
 CREATE INDEX IF NOT EXISTS idx_api_calls_model     ON api_calls(model);
@@ -169,8 +218,11 @@ CREATE INDEX IF NOT EXISTS idx_sessions_entrypoint ON sessions(entrypoint);
 # ── DB helpers ────────────────────────────────────────────────────────────────
 def open_db() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(DB_PATH)
+    # The hook, the CLI and the dashboard can all write at the same time now, so
+    # wait for a busy database instead of failing instantly.
+    con = sqlite3.connect(DB_PATH, timeout=15)
     con.row_factory = sqlite3.Row
+    con.execute("PRAGMA busy_timeout = 15000")
     con.executescript(SCHEMA)
     # Migrate: add im_source if this is an existing DB without it
     cols = {r[1] for r in con.execute("PRAGMA table_info(sessions)")}
@@ -180,6 +232,19 @@ def open_db() -> sqlite3.Connection:
         con.execute("ALTER TABLE sessions ADD COLUMN session_name TEXT")
     con.commit()
     return con
+
+
+# ── tracker_meta helpers ──────────────────────────────────────────────────────
+def get_meta(con: sqlite3.Connection, key: str, default=None):
+    row = con.execute("SELECT value FROM tracker_meta WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_meta(con: sqlite3.Connection, key: str, value: str) -> None:
+    con.execute("""
+        INSERT INTO tracker_meta (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    """, (key, str(value)))
 
 # ── JSONL parser ──────────────────────────────────────────────────────────────
 def parse_transcript(path: str) -> dict:
@@ -288,10 +353,28 @@ def parse_transcript(path: str) -> dict:
 
     models_seen: set[str] = set()
 
-    for seq, m in enumerate(assistant_msgs, start=1):
+    # Newer Claude Code versions write ONE JSONL record per content block
+    # (`apiBlockIndex` 0, 1, …). Every record of the same API response repeats
+    # the same `message.id` and carries the SAME, complete `usage` object.
+    # Counting each record separately multiplies the session total, so collapse
+    # them: usage is read once, content blocks are merged for the content stats.
+    grouped: dict[str, dict] = {}
+    ordered_keys: list[str] = []
+    for raw in assistant_msgs:
+        raw_msg = raw.get("message", {}) or {}
+        key = raw_msg.get("id") or raw.get("uuid") or ""
+        if key not in grouped:
+            grouped[key] = {"first": raw, "blocks": []}
+            ordered_keys.append(key)
+        blocks = raw_msg.get("content")
+        if isinstance(blocks, list):
+            grouped[key]["blocks"].extend(blocks)
+
+    for seq, key in enumerate(ordered_keys, start=1):
+        m       = grouped[key]["first"]
         msg     = m.get("message", {})
         usage   = msg.get("usage", {})
-        content = msg.get("content", []) or []
+        content = grouped[key]["blocks"]
 
         model       = msg.get("model", "")
         message_id  = msg.get("id", "")
@@ -571,10 +654,97 @@ def process_session(con: sqlite3.Connection, session_id: str, transcript_path: s
     ]
     insert_tool_calls(con, new_tool_calls)
 
-    dates = list({ts[:10] for c in api_calls if (ts := c.get("timestamp", ""))[:10]})
+    dates = list({c["timestamp"][:10] for c in api_calls if c.get("timestamp")})
     rebuild_daily_summary(con, dates)
     con.commit()
     return True
+
+
+# ── Catch-up safety net ───────────────────────────────────────────────────────
+# The Stop hook is best-effort: headless/SDK runs may never fire it, and when it
+# does fire the transcript for the turn being finished is not always flushed to
+# disk yet. Catch-up closes both gaps — it re-scans ~/.claude/projects and
+# ingests every transcript that is new or has changed since the previous scan.
+def _mark_ingested(con: sqlite3.Connection, path: Path, st: os.stat_result) -> None:
+    con.execute("""
+        INSERT INTO ingest_state (path, mtime, size, ingested_at)
+        VALUES (?, ?, ?, datetime('now'))
+        ON CONFLICT(path) DO UPDATE SET
+            mtime       = excluded.mtime,
+            size        = excluded.size,
+            ingested_at = datetime('now')
+    """, (str(path), st.st_mtime, st.st_size))
+
+
+def _needs_ingest(con: sqlite3.Connection, path: Path, st: os.stat_result) -> bool:
+    row = con.execute(
+        "SELECT mtime, size FROM ingest_state WHERE path = ?", (str(path),)
+    ).fetchone()
+    if row is None:
+        return True
+    if abs((row["mtime"] or 0.0) - st.st_mtime) > 1e-6:
+        return True
+    return (row["size"] or -1) != st.st_size
+
+
+def catch_up(con: sqlite3.Connection, force: bool = False,
+             projects_dir: Path | str | None = None) -> int:
+    """
+    Ingest every transcript under the projects dir that is new or modified since
+    the last scan. Idempotent (upsert + INSERT OR IGNORE), so it doubles as a
+    repair pass for sessions the hook recorded too early.
+
+    `force` skips the minimum-interval throttle; unchanged files are still
+    skipped (use --backfill to re-read everything unconditionally).
+    Returns the number of transcripts ingested.
+    """
+    base = Path(projects_dir) if projects_dir else PROJECTS_DIR
+    if not base.is_dir():
+        return 0
+
+    if not force:
+        try:
+            last = float(get_meta(con, "last_catchup", "0") or 0)
+        except (TypeError, ValueError):
+            last = 0.0
+        if time.time() - last < CATCHUP_INTERVAL:
+            return 0
+
+    ingested = 0
+    try:
+        files = sorted(base.rglob("*.jsonl"))
+    except OSError:
+        return 0
+
+    for f in files:
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        if not _needs_ingest(con, f, st):
+            continue
+        try:
+            if process_session(con, f.stem, str(f)):
+                ingested += 1
+        except Exception as e:
+            # Do not mark this file as ingested — retry on the next scan.
+            print(f"claude-token-tracker: catch-up failed for {f.name}: {e}",
+                  file=sys.stderr)
+            continue
+        _mark_ingested(con, f, st)
+
+    set_meta(con, "last_catchup", str(time.time()))
+    con.commit()
+    return ingested
+
+
+def run_catch_up(force: bool = True, projects_dir: Path | str | None = None) -> int:
+    """Open the DB and run one catch-up scan (used by --catch-up and the dashboard)."""
+    con = open_db()
+    try:
+        return catch_up(con, force=force, projects_dir=projects_dir)
+    finally:
+        con.close()
 
 
 # ── Entry points ──────────────────────────────────────────────────────────────
@@ -601,6 +771,22 @@ def run_hook() -> None:
     con = open_db()
     try:
         process_session(con, session_id, transcript_path, im_source=im_source)
+
+        # Remember the transcript we just handled so the catch-up below does not
+        # parse it a second time.
+        try:
+            p = Path(transcript_path)
+            _mark_ingested(con, p, p.stat())
+            con.commit()
+        except OSError:
+            pass
+
+        # Safety net: pick up sessions whose Stop hook never fired (headless/SDK
+        # runs) plus turns that were not flushed to disk yet when this hook ran.
+        try:
+            catch_up(con)
+        except Exception as e:
+            print(f"claude-token-tracker: catch-up failed: {e}", file=sys.stderr)
     finally:
         con.close()
 
@@ -620,9 +806,16 @@ def run_backfill(projects_dir: str) -> None:
                 ok += 1
             else:
                 skip += 1
+            # Record the revision we just read so catch-up can skip it later.
+            try:
+                _mark_ingested(con, f, f.stat())
+            except OSError:
+                pass
         except Exception as e:
             print(f"  WARN {f.name}: {e}", file=sys.stderr)
             skip += 1
+    set_meta(con, "last_catchup", str(time.time()))
+    con.commit()
     con.close()
     print(f"Backfill done: {ok} sessions ingested, {skip} skipped.")
 
@@ -631,9 +824,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Claude Code token tracker")
     parser.add_argument("--backfill", metavar="PROJECTS_DIR",
                         help="Scan all JSONL files in PROJECTS_DIR and ingest into SQLite")
+    parser.add_argument("--catch-up", action="store_true",
+                        help="Ingest transcripts that are new or changed since the last scan")
     args = parser.parse_args()
 
     if args.backfill:
         run_backfill(args.backfill)
+    elif args.catch_up:
+        n = run_catch_up(force=True)
+        print(f"Catch-up done: {n} session(s) ingested.")
     else:
         run_hook()

@@ -21,7 +21,8 @@ Track your Claude Code usage — tokens, cost, and sessions — in a local SQLit
 ## Prerequisites
 
 - [Claude Code](https://claude.ai/code) installed and configured
-- Python 3.9+
+- Python 3.7+ — nothing is hardcoded: the hook launcher picks a usable
+  interpreter from your `PATH` at run time and reports an error if there is none
 - Flask: `pip3 install flask`
 
 ## Install
@@ -34,11 +35,51 @@ chmod +x install.sh
 ```
 
 The installer:
-1. Checks Python and Flask
+1. Finds a usable Python 3 on `PATH` and checks/installs Flask
 2. Registers a **Stop hook** in `~/.claude/settings.json` — fires automatically after every Claude Code session
 3. Backfills all existing sessions from `~/.claude/projects/`
 
+The registered command is a small portable launcher (`hook.sh`), not a hardcoded
+interpreter path, so it keeps working across machines, Python upgrades and
+package managers.
+
 After install, new sessions are tracked automatically — no manual steps needed.
+
+## Upgrade
+
+Already installed? Upgrading is one command:
+
+```bash
+cd claude-token-tracker
+git pull
+./install.sh
+```
+
+The installer is safe to re-run and does everything for you:
+
+1. Migrates the hook registration to the current portable launcher
+   (`python3 …/tracker.py` → `sh …/hook.sh`) and removes the previous entry —
+   it prints what it removed, so nothing is changed silently
+2. Re-detects a usable Python 3
+3. Re-reads every transcript in `~/.claude/projects/`. This also **repairs
+   historical sessions**: older versions counted a session's tokens ~2× too
+   high, and re-ingesting recalculates them
+
+Nothing has to be migrated by hand — new database tables are created
+automatically the first time any part of the tool runs (hook, CLI or dashboard).
+
+Notes:
+
+- Local changes in the checkout? `git stash && git pull && ./install.sh`
+- Installed from a ZIP rather than `git clone`? Download the new ZIP, then run
+  `./install.sh` from the new folder — the old hook is removed even though the
+  path changed
+- Verify afterwards:
+
+```bash
+python3 tracker.py --catch-up   # reports the sessions it picked up
+python3 stats.py today          # shows today's usage
+```
 
 ## Web Dashboard
 
@@ -61,13 +102,25 @@ Also accessible from other devices on the same LAN: `http://<your-lan-ip>:5001`
 
 ## When does a new session appear?
 
-Sessions are recorded by a **Stop hook** — it fires when Claude Code finishes a response. So the very latest turn of an ongoing session may not appear until the session ends or you run a manual backfill:
+Sessions are recorded by a **Stop hook** — it fires when Claude Code finishes a response.
+
+Because a hook is best-effort (headless/SDK sessions may never fire it, and it can
+run before the transcript of the finishing turn is flushed to disk), the tracker
+also runs a **catch-up** pass that re-scans `~/.claude/projects/` and ingests
+anything new or changed:
+
+- after every tracked turn (throttled, ~1 scan/minute)
+- every 5 minutes while the dashboard is running
+- on demand:
 
 ```bash
-python3 tracker.py --backfill ~/.claude/projects/
+python3 tracker.py --catch-up                    # only new/changed transcripts
+python3 tracker.py --backfill ~/.claude/projects/ # re-read everything
 ```
 
-This is safe to run multiple times (uses upsert).
+Both are safe to run repeatedly (upsert + `INSERT OR IGNORE`). Catch-up is
+skipped while the dashboard is stopped only if you set
+`CLAUDE_TRACKER_NO_CATCHUP=1`.
 
 ## IM Session Tagging
 
@@ -116,7 +169,8 @@ CLAUDE_TRACKER_DB=/path/to/custom.db python3 server.py
 
 ```
 claude-token-tracker/
-├── tracker.py        # Stop hook script + backfill mode
+├── tracker.py        # Stop hook script + backfill/catch-up modes
+├── hook.sh           # portable launcher the Stop hook actually runs
 ├── stats.py          # CLI query tool
 ├── server.py         # Flask web dashboard
 ├── templates/

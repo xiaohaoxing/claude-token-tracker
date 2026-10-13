@@ -7,10 +7,16 @@ Run: python3 server.py  (default port 5000)
 import json
 import os
 import sqlite3
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
+
+# Reused for the catch-up safety net (see start_catchup_thread below).
+# tracker.py lives next to this file, so a plain import works.
+import tracker
 
 DB_PATH = Path(os.environ.get("CLAUDE_TRACKER_DB",
                Path.home() / ".claude" / "token-tracker" / "token_stats.db"))
@@ -296,6 +302,34 @@ def filters():
     })
 
 
+# ── Catch-up safety net ───────────────────────────────────────────────────────
+# The Stop hook is best-effort: headless/SDK sessions may never fire it, and when
+# it does fire the transcript for the finishing turn is not always flushed yet.
+# While the dashboard is running, re-scan the transcript directory periodically
+# and ingest anything new or changed, so nothing stays missing.
+CATCHUP_EVERY = float(os.environ.get("CLAUDE_TRACKER_CATCHUP_EVERY", "300"))
+
+
+def _catchup_loop() -> None:
+    while True:
+        time.sleep(CATCHUP_EVERY)
+        try:
+            n = tracker.run_catch_up(force=True)
+            if n:
+                print(f"[catch-up] ingested {n} session(s)", flush=True)
+        except Exception as e:  # never let the watcher kill the dashboard
+            print(f"[catch-up] failed: {e}", flush=True)
+
+
+def start_catchup_thread() -> None:
+    if os.environ.get("CLAUDE_TRACKER_NO_CATCHUP") == "1":
+        print("  catch-up : disabled (CLAUDE_TRACKER_NO_CATCHUP=1)")
+        return
+    threading.Thread(target=_catchup_loop, name="token-tracker-catchup",
+                     daemon=True).start()
+    print(f"  catch-up : every {int(CATCHUP_EVERY)}s")
+
+
 if __name__ == "__main__":
     import socket
     import sys
@@ -307,4 +341,5 @@ if __name__ == "__main__":
     print(f"Claude Usage Dashboard")
     print(f"  Local  → http://localhost:{port}")
     print(f"  LAN    → http://{lan_ip}:{port}")
+    start_catchup_thread()
     app.run(host="0.0.0.0", port=port, debug=False)
