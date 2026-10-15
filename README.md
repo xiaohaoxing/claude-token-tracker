@@ -94,6 +94,33 @@ python3 tracker.py --catch-up   # reports the sessions it picked up
 python3 stats.py today          # shows today's usage
 ```
 
+## Troubleshooting
+
+Everything the tool does is logged to `~/.claude/token-tracker/logs/` —
+`tracker.log` for the hook and CLI, `dashboard.log` for the web server (including
+unhandled request exceptions).
+
+One command turns the current state into a report you can send to support:
+
+```bash
+sh hook.sh --doctor                                  # print it
+sh hook.sh --doctor --out ~/Desktop/report.txt        # save it
+```
+
+`--doctor` still answers when Python itself is the broken thing — `hook.sh`
+falls back to a shell-level report in that case. The report contains **no
+prompts, messages, transcript contents or credentials**: only versions,
+file/schema state, counters and log lines.
+
+What it tells you:
+
+| Symptom | Section to look at |
+|---|---|
+| nothing is being tracked | `Hook registration`, `Activity` (last hook run, error count) |
+| dashboard returns 500s | `Database` (missing columns), `dashboard.log` tail |
+| "unsupported Python" | `Runtime`, plus the interpreter list from `hook.sh` |
+| data looks stale | `Database` (latest session), `last catch-up`, `Activity` |
+
 ## Web Dashboard
 
 ```bash

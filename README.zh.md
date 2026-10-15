@@ -89,6 +89,31 @@ python3 tracker.py --catch-up   # 输出这次补进来的会话数
 python3 stats.py today          # 查看今天的用量
 ```
 
+## 排查问题
+
+工具的运行日志都在 `~/.claude/token-tracker/logs/` 下：`tracker.log` 记录 hook 和
+命令行，`dashboard.log` 记录看板服务（包含未捕获的请求异常）。
+
+一条命令就能把当前状态整理成可以直接发给我们的报告：
+
+```bash
+sh hook.sh --doctor                                   # 直接打印
+sh hook.sh --doctor --out ~/Desktop/report.txt         # 保存成文件
+```
+
+即使出问题的就是 Python 本身，`--doctor` 依然可用 —— 这种情况下 `hook.sh` 会退化成
+纯 shell 的环境报告。报告里**不包含任何 prompt、消息、transcript 内容或密钥**，
+只有版本、文件/schema 状态、计数和日志行。
+
+它能帮你定位：
+
+| 现象 | 看报告中哪一节 |
+|---|---|
+| 完全没有追踪记录 | `Hook registration`、`Activity`（最后一次 hook、错误数） |
+| 看板返回 500 | `Database`（缺哪些列）、`dashboard.log` 尾部 |
+| 提示 "unsupported Python" | `Runtime`，以及 `hook.sh` 列出的解释器 |
+| 数据不更新 | `Database`（最新会话时间）、`last catch-up`、`Activity` |
+
 ## 启动 Web 看板
 
 ```bash

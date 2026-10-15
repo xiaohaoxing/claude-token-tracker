@@ -5,12 +5,14 @@ Run: python3 server.py  (default port 5000)
 """
 
 import json
+import logging
 import os
 import socket
 import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
@@ -28,6 +30,31 @@ app = Flask(__name__,
             static_folder=str(Path(__file__).parent / "static"))
 app.config["JSON_SORT_KEYS"] = False
 app.config["TEMPLATES_AUTO_RELOAD"] = True
+
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+# Unhandled request exceptions (the "no such column" class of bug) otherwise
+# exist only in whatever terminal or pm2 log started us — which a user cannot
+# hand over. Persist them next to the tracker log so `--doctor` can include them.
+def _setup_logging() -> None:
+    try:
+        tracker.LOG_DIR.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            tracker.DASHBOARD_LOG, maxBytes=tracker.LOG_MAX_BYTES,
+            backupCount=tracker.LOG_BACKUPS, encoding="utf-8")
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-5s %(name)s: %(message)s"))
+        app.logger.addHandler(handler)
+        app.logger.setLevel(logging.INFO)
+        # Werkzeug's per-request lines are noisy; keep warnings and errors only.
+        wlog = logging.getLogger("werkzeug")
+        wlog.addHandler(handler)
+        wlog.setLevel(logging.WARNING)
+    except OSError:
+        pass
+
+
+_setup_logging()
 
 
 # ── DB helper ────────────────────────────────────────────────────────────────
@@ -331,8 +358,10 @@ def _catchup_loop() -> None:
             n = tracker.run_catch_up(force=True)
             if n:
                 print(f"[catch-up] ingested {n} session(s)", flush=True)
+                tracker.log_event("INFO", f"dashboard catch-up ingested={n}")
         except Exception as e:  # never let the watcher kill the dashboard
             print(f"[catch-up] failed: {e}", flush=True)
+            tracker.log_exception("dashboard catch-up", e)
 
 
 def start_catchup_thread() -> None:
@@ -382,5 +411,8 @@ if __name__ == "__main__":
         print("  DB     → schema up to date")
     except Exception as e:
         print(f"  DB     → WARNING: {e}")
+        tracker.log_exception("dashboard startup schema check", e)
+    tracker.log_event("INFO", f"dashboard start port={port} pid={os.getpid()} "
+                              f"db={DB_PATH}")
     start_catchup_thread()
     app.run(host="0.0.0.0", port=port, debug=False)

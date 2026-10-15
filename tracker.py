@@ -16,10 +16,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import re
 import sqlite3
 import sys
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -52,6 +54,58 @@ PROJECTS_DIR = Path(os.environ.get("CLAUDE_TRACKER_PROJECTS",
 
 # Minimum seconds between two automatic catch-up scans (0 = every hook run).
 CATCHUP_INTERVAL = float(os.environ.get("CLAUDE_TRACKER_CATCHUP_INTERVAL", "60"))
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+# Without a log of its own the tool is undebuggable: the hook's stderr is
+# swallowed by Claude Code and the dashboard's traceback only exists in whatever
+# terminal (or pm2) happened to start it. Everything worth knowing is appended
+# here instead, so `--doctor` can hand a support report to the user.
+LOG_DIR          = Path(os.environ.get("CLAUDE_TRACKER_LOG_DIR", DB_PATH.parent / "logs"))
+LOG_PATH         = LOG_DIR / "tracker.log"
+DASHBOARD_LOG    = LOG_DIR / "dashboard.log"
+LOG_MAX_BYTES    = int(os.environ.get("CLAUDE_TRACKER_LOG_MAX_BYTES", "1000000"))
+LOG_BACKUPS      = 2
+LOG_TAIL_LINES   = 120
+
+
+def _rotate_log(path: Path) -> None:
+    """Size-based rotation, best effort. Called right before an append."""
+    try:
+        if not path.exists() or path.stat().st_size < LOG_MAX_BYTES:
+            return
+        oldest = Path(f"{path}.{LOG_BACKUPS}")
+        if oldest.exists():
+            oldest.unlink()
+        for i in range(LOG_BACKUPS - 1, 0, -1):
+            src = Path(f"{path}.{i}")
+            if src.exists():
+                src.rename(Path(f"{path}.{i + 1}"))
+        path.rename(Path(f"{path}.1"))
+    except OSError:
+        pass
+
+
+def log_event(level: str, message: str) -> None:
+    """Append one line to the tracker log. Never raises, never blocks work."""
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _rotate_log(LOG_PATH)
+        stamp = datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"{stamp} {level.upper():<5} {message}\n")
+    except Exception:
+        pass
+
+
+def log_exception(context: str, exc: BaseException, limit: int = 2000) -> None:
+    """Log an exception with its traceback, truncated so the log stays small."""
+    try:
+        detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip()
+    except Exception:
+        detail = repr(exc)
+    if len(detail) > limit:
+        detail = detail[:limit] + " …[truncated]"
+    log_event("ERROR", f"{context}: {detail}")
 
 # ── Pricing table (USD per 1M tokens) ────────────────────────────────────────
 PRICING: dict[str, dict[str, float]] = {
@@ -741,11 +795,14 @@ def catch_up(con: sqlite3.Connection, force: bool = False,
             # Do not mark this file as ingested — retry on the next scan.
             print(f"claude-token-tracker: catch-up failed for {f.name}: {e}",
                   file=sys.stderr)
+            log_exception(f"catch-up {f.name}", e)
             continue
         _mark_ingested(con, f, st)
 
     set_meta(con, "last_catchup", str(time.time()))
     con.commit()
+    if ingested:
+        log_event("INFO", f"catch-up ingested={ingested}")
     return ingested
 
 
@@ -756,6 +813,244 @@ def run_catch_up(force: bool = True, projects_dir: Path | str | None = None) -> 
         return catch_up(con, force=force, projects_dir=projects_dir)
     finally:
         con.close()
+
+
+# ── Diagnostics (--doctor) ────────────────────────────────────────────────────
+# Goal: a user who cannot debug anything can run one command and hand back a
+# file that answers "what version, what state, what failed" — without leaking
+# their prompts, transcripts, or credentials.
+_REDACT_PATTERNS = (
+    (re.compile(r"(?i)\b(sk-[A-Za-z0-9_\-]{8,})"), "sk-***"),
+    (re.compile(r"\b(gh[pousr])_[A-Za-z0-9]{16,}"), r"\1_***"),
+    (re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._\-]{8,}"), r"\1 ***"),
+    # KEY=value — the key may carry a prefix (ANTHROPIC_AUTH_TOKEN), where a
+    # leading \b does not match before the `_`, so match the identifier instead.
+    (re.compile(r"(?i)([A-Za-z0-9_]{0,40}(?:api[_-]?key|auth[_-]?token|access[_-]?token"
+                r"|secret|password|credential)[A-Za-z0-9_]{0,20})\"?\s*[:=]\s*[^\s,;]+"),
+     r"\1=***"),
+    # Weaker names (token / key / pwd …) but only when the value is quoted, so
+    # diagnostics such as total_cache_read_tokens=42 survive untouched.
+    (re.compile(r"(?i)\b([A-Za-z0-9_]{0,40}(?:token|key|secret|password|passwd|pwd)"
+                r"[A-Za-z0-9_]{0,20})\"?\s*[:=]\s*([\"'])[^\"'\n]*\2"),
+     r"\1=***"),
+)
+
+
+def redact(text: str) -> str:
+    """Strip credentials and user-identifying paths from anything we export."""
+    if not text:
+        return ""
+    out = str(text).replace(str(Path.home()), "~")
+    out = re.sub(r"/(?:Users|home)/[^/\s:\"']+", "~", out)
+    for pat, rep in _REDACT_PATTERNS:
+        out = pat.sub(rep, out)
+    return out
+
+
+def _tail(path: Path, lines: int = LOG_TAIL_LINES) -> list[str]:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            rows = f.readlines()
+        return [r.rstrip("\n") for r in rows[-lines:]]
+    except OSError:
+        return []
+
+
+def _hook_report() -> list[str]:
+    settings = Path.home() / ".claude" / "settings.json"
+    lines = [f"settings file : {settings} ({'present' if settings.exists() else 'MISSING'})"]
+    if not settings.exists():
+        return lines
+    try:
+        with open(settings, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        lines.append(f"  cannot parse  : {e}")
+        return lines
+
+    groups = data.get("hooks", {}).get("Stop", []) or []
+    ours, others = [], 0
+    for g in groups:
+        for h in g.get("hooks", []) or []:
+            cmd = h.get("command", "")
+            if "token-tracker" in cmd or re.search(r"hook\.sh|tracker\.py", cmd):
+                ours.append(cmd)
+            else:
+                others += 1
+    lines.append(f"Stop hooks    : {len(ours)} from this tool, {others} from something else")
+    for cmd in ours:
+        lines.append(f"  registered  : {cmd}")
+    if not ours:
+        lines.append("  registered  : NONE — the Stop hook is not installed")
+    return lines
+
+
+def _claude_code_report() -> list[str]:
+    lines = []
+    upd = Path.home() / ".claude" / ".last-update-result.json"
+    if upd.exists():
+        try:
+            with open(upd, encoding="utf-8") as f:
+                d = json.load(f)
+            lines.append(f"last update   : {d.get('version_from')} → {d.get('version_to')} "
+                         f"at {d.get('timestamp')} ({d.get('outcome')})")
+        except Exception:
+            pass
+    lines.append(f"projects dir  : {PROJECTS_DIR} "
+                 f"({'present' if PROJECTS_DIR.is_dir() else 'MISSING'})")
+    if PROJECTS_DIR.is_dir():
+        files = list(PROJECTS_DIR.rglob("*.jsonl"))
+        lines.append(f"transcripts   : {len(files)}")
+        if files:
+            import datetime as _dt
+            newest = max(files, key=lambda p: p.stat().st_mtime)
+            oldest = min(files, key=lambda p: p.stat().st_mtime)
+            lines.append(f"  newest      : {_dt.datetime.fromtimestamp(newest.stat().st_mtime)}")
+            lines.append(f"  oldest      : {_dt.datetime.fromtimestamp(oldest.stat().st_mtime)}")
+            lines.append("  note        : Claude Code deletes transcripts after ~30 days")
+    return lines
+
+
+def _db_report() -> list[str]:
+    lines = [f"path          : {DB_PATH}",
+             f"exists        : {DB_PATH.exists()}"
+             + (f" ({DB_PATH.stat().st_size / 1048576:.1f} MB)" if DB_PATH.exists() else ""),
+             f"dir writable  : {os.access(DB_PATH.parent, os.W_OK) if DB_PATH.parent.exists() else False}"]
+    if not DB_PATH.exists():
+        return lines
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=10)
+        con.row_factory = sqlite3.Row
+        # Diagnostics must never modify anything.
+        con.execute("PRAGMA query_only = ON")
+    except Exception as e:
+        lines.append(f"cannot open   : {e}")
+        return lines
+    try:
+        tables = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        lines.append(f"tables        : {', '.join(sorted(tables)) or '(none)'}")
+        for t in ("sessions", "api_calls", "tool_calls", "daily_summary",
+                  "ingest_state", "tracker_meta"):
+            if t not in tables:
+                lines.append(f"  MISSING     : {t}")
+        if "sessions" in tables:
+            cols = {r[1] for r in con.execute("PRAGMA table_info(sessions)")}
+            missing = sorted({"session_id", "im_source", "session_name", "transcript_path"} - cols)
+            lines.append(f"sessions cols : {len(cols)}"
+                         + (f", MISSING {', '.join(missing)}" if missing else ", complete"))
+        for t in ("sessions", "api_calls", "tool_calls", "daily_summary", "ingest_state"):
+            if t in tables:
+                lines.append(f"  rows {t:<14}: {con.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]}")
+        if "sessions" in tables:
+            r = con.execute("SELECT MAX(started_at), MAX(updated_at) FROM sessions").fetchone()
+            lines.append(f"latest session: {r[0]} (row updated {r[1]})")
+        if "api_calls" in tables:
+            lines.append(f"latest api call: {con.execute('SELECT MAX(timestamp) FROM api_calls').fetchone()[0]}")
+        if "tracker_meta" in tables:
+            r = con.execute("SELECT value FROM tracker_meta WHERE key='last_catchup'").fetchone()
+            if r and r[0]:
+                import datetime as _dt
+                lines.append("last catch-up : "
+                             f"{_dt.datetime.fromtimestamp(float(r[0]))}")
+    except Exception as e:
+        lines.append(f"query failed  : {type(e).__name__}: {e}")
+    finally:
+        con.close()
+    return lines
+
+
+def build_report() -> str:
+    out: list[str] = []
+
+    def add(text: str = "") -> None:
+        out.append(redact(text))
+
+    def section(title: str) -> None:
+        add()
+        add(f"── {title} " + "─" * max(3, 60 - len(title)))
+
+    add("Claude Token Tracker — diagnostics report")
+    add(f"generated  : {datetime.now().astimezone().strftime('%Y-%m-%dT%H:%M:%S%z')}")
+    add("contents   : versions, file/schema state, counters and log lines only.")
+    add("             No prompts, messages, transcript contents or API keys.")
+
+    section("Runtime")
+    add(f"python        : {sys.version.split()[0]} ({sys.implementation.name})")
+    add(f"executable    : {sys.executable}")
+    add(f"platform      : {platform.platform()}")
+    add(f"cwd           : {os.getcwd()}")
+    for var in ("CLAUDE_TRACKER_DB", "CLAUDE_TRACKER_PROJECTS", "CLAUDE_TRACKER_LOG_DIR",
+                "CLAUDE_TRACKER_CATCHUP_INTERVAL", "CLAUDE_TRACKER_NO_CATCHUP", "CTI_RUNTIME"):
+        add(f"{var:<14}: {os.environ.get(var, '(unset)')}")
+
+    section("Installation")
+    repo = Path(__file__).resolve().parent
+    add(f"repo dir      : {repo}")
+    for name in ("tracker.py", "hook.sh", "server.py", "stats.py", "install.sh",
+                 "templates/index.html"):
+        p = repo / name
+        if not p.exists():
+            add(f"  {name:<20}: MISSING")
+        else:
+            mode = oct(p.stat().st_mode)[-3:]
+            add(f"  {name:<20}: present (mode {mode})")
+
+    section("Hook registration")
+    for line in _hook_report():
+        add(line)
+
+    section("Claude Code")
+    for line in _claude_code_report():
+        add(line)
+
+    section("Database")
+    for line in _db_report():
+        add(line)
+
+    tlog = _tail(LOG_PATH)
+    dlog = _tail(DASHBOARD_LOG, 60)
+    hook_runs = [l for l in tlog if "hook session=" in l]
+    errors = [l for l in tlog + dlog if " ERROR " in l or "Traceback" in l]
+
+    section("Activity")
+    add(f"tracker log   : {LOG_PATH} ({'present' if LOG_PATH.exists() else 'not created yet'})")
+    add(f"dashboard log : {DASHBOARD_LOG} ({'present' if DASHBOARD_LOG.exists() else 'not created yet'})")
+    add(f"hook runs     : {len(hook_runs)} in the last {LOG_TAIL_LINES} log lines")
+    add(f"last hook run : {hook_runs[-1] if hook_runs else '(none logged)'}")
+    add(f"errors        : {len(errors)} in the last {LOG_TAIL_LINES} log lines")
+    for e in errors[-8:]:
+        add(f"  {e}")
+
+    section(f"{LOG_PATH.name} (last {LOG_TAIL_LINES} lines)")
+    for line in tlog or ["(empty)"]:
+        add(f"  {line}")
+
+    section(f"{DASHBOARD_LOG.name} (last 60 lines)")
+    for line in dlog or ["(empty)"]:
+        add(f"  {line}")
+
+    section("Send this to support")
+    add("Everything above is safe to share. To save it as a file:")
+    add(f"  python3 {Path(__file__).resolve()} --doctor --out ~/Desktop/token-tracker-report.txt")
+    return "\n".join(out)
+
+
+def run_doctor(out_path: str | None = None) -> None:
+    report = build_report()
+    if not out_path:
+        print(report)
+        return
+    target = Path(os.path.expanduser(out_path))
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(report + "\n", encoding="utf-8")
+    except OSError as e:
+        print(f"claude-token-tracker: could not write {target}: {e}", file=sys.stderr)
+        print(report)
+        sys.exit(1)
+    print(f"Diagnostics written to {target}")
+    print("Send that file to support — it contains no prompts, messages or API keys.")
 
 
 # ── Entry points ──────────────────────────────────────────────────────────────
@@ -773,37 +1068,60 @@ def run_hook() -> None:
     transcript_path = data.get("transcript_path", "")
 
     if not session_id or not transcript_path:
+        log_event("WARN", f"hook payload missing session_id/transcript_path "
+                          f"(keys={sorted(data)})")
         sys.exit(0)
 
     # Detect IM origin: claude-to-im passes CTI_* env vars to the Claude subprocess,
     # which the Stop hook inherits. CTI_RUNTIME being set is the reliable signal.
     im_source = "cti" if os.environ.get("CTI_RUNTIME") else None
 
-    con = open_db()
     try:
-        process_session(con, session_id, transcript_path, im_source=im_source)
-
-        # Remember the transcript we just handled so the catch-up below does not
-        # parse it a second time.
+        con = open_db()
         try:
-            p = Path(transcript_path)
-            _mark_ingested(con, p, p.stat())
-            con.commit()
-        except OSError:
-            pass
+            processed = process_session(con, session_id, transcript_path,
+                                        im_source=im_source)
 
-        # Safety net: pick up sessions whose Stop hook never fired (headless/SDK
-        # runs) plus turns that were not flushed to disk yet when this hook ran.
-        try:
-            catch_up(con)
-        except Exception as e:
-            print(f"claude-token-tracker: catch-up failed: {e}", file=sys.stderr)
-    finally:
-        con.close()
+            # Remember the transcript we just handled so the catch-up below does
+            # not parse it a second time.
+            try:
+                p = Path(transcript_path)
+                _mark_ingested(con, p, p.stat())
+                con.commit()
+            except OSError:
+                pass
+
+            # Safety net: pick up sessions whose Stop hook never fired (headless/SDK
+            # runs) plus turns that were not flushed to disk yet when this hook ran.
+            try:
+                catch_up(con)
+            except Exception as e:
+                print(f"claude-token-tracker: catch-up failed: {e}", file=sys.stderr)
+                log_exception("hook catch-up", e)
+
+            row = con.execute(
+                "SELECT session_id, total_api_calls, total_input_tokens, total_output_tokens "
+                "FROM sessions WHERE transcript_path = ?", (transcript_path,)).fetchone()
+            if row:
+                log_event("INFO", f"hook session={row['session_id']} "
+                                  f"calls={row['total_api_calls']} "
+                                  f"in={row['total_input_tokens']} "
+                                  f"out={row['total_output_tokens']}")
+            else:
+                log_event("WARN", f"hook session={session_id} processed={int(bool(processed))} "
+                                  f"no row written for {Path(transcript_path).name}")
+        finally:
+            con.close()
+    except Exception as e:
+        log_exception(f"hook session={session_id}", e)
+        # Non-zero exit so Claude Code surfaces the failure instead of hiding it.
+        print(f"claude-token-tracker: {type(e).__name__}: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 def run_backfill(projects_dir: str) -> None:
     """Scan all JSONL files under projects_dir and ingest them."""
+    log_event("INFO", f"backfill start dir={projects_dir}")
     con = open_db()
     base = Path(projects_dir)
     files = sorted(base.rglob("*.jsonl"))
@@ -824,10 +1142,12 @@ def run_backfill(projects_dir: str) -> None:
                 pass
         except Exception as e:
             print(f"  WARN {f.name}: {e}", file=sys.stderr)
+            log_exception(f"backfill {f.name}", e)
             skip += 1
     set_meta(con, "last_catchup", str(time.time()))
     con.commit()
     con.close()
+    log_event("INFO", f"backfill done ingested={ok} skipped={skip}")
     print(f"Backfill done: {ok} sessions ingested, {skip} skipped.")
 
 
@@ -837,9 +1157,15 @@ if __name__ == "__main__":
                         help="Scan all JSONL files in PROJECTS_DIR and ingest into SQLite")
     parser.add_argument("--catch-up", action="store_true",
                         help="Ingest transcripts that are new or changed since the last scan")
+    parser.add_argument("--doctor", action="store_true",
+                        help="Print a shareable diagnostics report (no prompts or secrets)")
+    parser.add_argument("--out", metavar="FILE",
+                        help="With --doctor: write the report to FILE instead of stdout")
     args = parser.parse_args()
 
-    if args.backfill:
+    if args.doctor:
+        run_doctor(args.out)
+    elif args.backfill:
         run_backfill(args.backfill)
     elif args.catch_up:
         n = run_catch_up(force=True)
