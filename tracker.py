@@ -911,11 +911,33 @@ def _claude_code_report() -> list[str]:
     return lines
 
 
+def _dir_writable(path: Path) -> bool:
+    """
+    Ground truth beats os.access: sandboxes and ACLs can disagree with it, and a
+    false "not writable" sends support down the wrong path. The probe file is
+    removed immediately and holds no data.
+    """
+    if not path.exists():
+        return False
+    probe = path / ".token-tracker-write-probe"
+    try:
+        with open(probe, "a"):
+            pass
+        return True
+    except OSError:
+        return os.access(path, os.W_OK)
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+
+
 def _db_report() -> list[str]:
     lines = [f"path          : {DB_PATH}",
              f"exists        : {DB_PATH.exists()}"
              + (f" ({DB_PATH.stat().st_size / 1048576:.1f} MB)" if DB_PATH.exists() else ""),
-             f"dir writable  : {os.access(DB_PATH.parent, os.W_OK) if DB_PATH.parent.exists() else False}"]
+             f"dir writable  : {_dir_writable(DB_PATH.parent)}"]
     if not DB_PATH.exists():
         return lines
     try:
