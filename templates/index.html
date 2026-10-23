@@ -752,26 +752,26 @@ let VERSION = null
 function renderVersion(v) {
   const el = document.getElementById('version-pill')
   if (!el) return
-  const cur = v.current ? 'v' + v.current : ''
+  const cur = v.current || (v.is_git ? 'untagged' : '')
   if (v.update_available && v.can_upgrade && v.token) {
     el.className = 'flex items-center gap-2'
     el.innerHTML = `<span class="text-xs text-slate-500">${cur}</span>
-      <button id="upgrade-btn" onclick="doUpgrade()"
+      <button id="upgrade-btn" onclick="doUpgrade()" title="Fast-forward to ${v.latest} and restart"
         class="text-xs bg-brand hover:bg-brand-dark px-3 py-1.5 rounded-lg text-white font-medium">
         Update to ${v.latest}
       </button>`
   } else if (v.update_available && v.local) {
     el.className = 'text-xs text-amber-400'
     el.title = v.blocker || ''
-    el.textContent = `Update ${v.latest} available — ${v.blocker || 'run git pull'}`
+    el.textContent = `${v.latest} available — ${v.blocker || 'run git pull'}`
   } else if (v.update_available) {
     el.className = 'text-xs text-slate-500'
-    el.title = '升级需要在安装机上操作'
-    el.textContent = `Update ${v.latest} available`
+    el.title = 'Update from the machine this dashboard is installed on'
+    el.textContent = `${v.latest} available`
   } else {
     el.className = 'text-xs text-slate-600'
     el.textContent = v.is_git ? cur : 'manual install'
-    el.title = v.check_error || ''
+    el.title = v.check_error || (v.current && v.current.includes('+') ? 'Unreleased commits on top of the last tag' : '')
   }
 }
 

@@ -148,10 +148,16 @@ Also accessible from other devices on the same LAN: `http://<your-lan-ip>:5001`
 
 **Version & one-click upgrade**
 
-The header shows the commit you are running. When the remote `main` is ahead,
-the dashboard says so and — if you are on the install machine — offers an
-**Update to `<sha>`** button. It fast-forwards the checkout (`git merge
---ff-only`) and restarts the dashboard in place; the page reloads itself.
+Versions are releases, not commits: a version exists only when a
+`v<major>.<minor>.<patch>` tag is pushed. The header shows the release you are
+running (`v1.0.0`, or `v1.0.0+3` when your checkout carries unreleased commits on
+top of it). Commits pushed to `main` between releases are never offered — the
+dashboard only moves between tags.
+
+When a newer tag exists, the dashboard says so and — if you are on the install
+machine — offers an **Update to `vX.Y.Z`** button. It fast-forwards the checkout
+onto that tag (`git merge --ff-only`) and restarts the dashboard in place; the
+page reloads itself.
 
 This is deliberately narrow, because the endpoint runs git and restarts a
 server that listens on `0.0.0.0`:
@@ -162,12 +168,22 @@ server that listens on `0.0.0.0`:
   which a page on another origin can neither read (no CORS) nor replay
   (a JSON request would need a preflight that fails);
 - it refuses dirty worktrees, branches other than `main`, ZIP installs (no
-  `.git`) and diverged history, so uncommitted work can never be lost;
+  `.git`), diverged history and local commits that are not part of the release,
+  so uncommitted work can never be lost;
 - the remote is checked by a background thread, so page loads never wait on the
   network (`git ls-remote` takes a few seconds).
 
 Tunable with `CLAUDE_TRACKER_UPDATE_CHECK=<seconds>` (default 900) and
 `CLAUDE_TRACKER_GIT_TIMEOUT=<seconds>` (default 20).
+
+**Cutting a release** (maintainers): land the changes on `main`, then tag that
+commit and push the tag — nothing else is needed, the dashboard picks it up on
+its next check.
+
+```bash
+git tag -a v1.2.0 -m "v1.2.0"
+git push origin v1.2.0
+```
 
 ## When does a new session appear?
 

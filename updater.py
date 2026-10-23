@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
-Version discovery and one-click upgrade for the dashboard.
+Release-driven version discovery and one-click upgrade.
 
-The dashboard is usually installed from a git checkout, so "is there a newer
-version?" is a comparison between the local HEAD and the remote branch tip, and
-"upgrade" is a fast-forward merge. Both are delegated to git rather than to a
-hand-rolled downloader: a user's local commits, a dirty tree or a diverged
-branch must all end in a clear refusal, never in lost work.
+The project ships releases as `vMAJOR.MINOR.PATCH` git tags. The dashboard never
+follows the branch tip: "is there a newer version?" means "is there a tag I do
+not contain yet?", and "upgrade" means fast-forwarding to that tag. Commits
+pushed to `main` between releases are therefore invisible to users, which is the
+point — they run what was tagged, not whatever landed last.
 
-Everything here is read-only unless upgrade() is called; that function refuses
-unless the checkout is clean, on the expected branch and behind the remote.
-The caller is responsible for the access control (server.py limits it to
-requests from this machine) and for restarting the process afterwards.
+Everything here is read-only unless upgrade() is called, and that refuses
+anything that could lose local work (dirty tree, wrong branch, diverged
+history). Access control lives in server.py; process restart lives there too.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -30,12 +30,27 @@ BRANCH = os.environ.get("CLAUDE_TRACKER_BRANCH", "main")
 CHECK_EVERY = float(os.environ.get("CLAUDE_TRACKER_UPDATE_CHECK", "900"))
 FETCH_TIMEOUT = float(os.environ.get("CLAUDE_TRACKER_GIT_TIMEOUT", "20"))
 
+TAG_GLOB = "v[0-9]*"
+_TAG_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+
 _STATE_TTL = 5.0
 _lock = threading.Lock()
 _local_cache: Dict[str, object] = {"at": 0.0, "state": None}
 _remote_cache: Dict[str, object] = {
-    "checked_at": 0.0, "head": None, "short": None, "ok": False, "error": "尚未检查",
+    "checked_at": 0.0, "ok": False, "error": "not checked yet",
+    "latest_tag": None, "latest_version": None, "latest_sha": None,
+    "ff_possible": None, "already": None,
 }
+
+
+# ── versions ──────────────────────────────────────────────────────────────────
+def parse_version(tag: Optional[str]) -> Optional[Tuple[int, int, int]]:
+    m = _TAG_RE.match((tag or "").strip())
+    return tuple(int(x) for x in m.groups()) if m else None  # type: ignore[return-value]
+
+
+def is_release_tag(tag: Optional[str]) -> bool:
+    return parse_version(tag) is not None
 
 
 # ── git plumbing ──────────────────────────────────────────────────────────────
@@ -49,9 +64,9 @@ def _git(*args: str, timeout: float = FETCH_TIMEOUT) -> Tuple[int, str, str]:
                            capture_output=True, text=True, timeout=timeout, env=env)
         return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
     except FileNotFoundError:
-        return 127, "", "git 未安装"
+        return 127, "", "git is not installed"
     except subprocess.TimeoutExpired:
-        return 124, "", f"git {args[0]} 超时（{timeout:.0f}s）"
+        return 124, "", f"git {args[0]} timed out after {timeout:.0f}s"
     except OSError as exc:
         return 1, "", str(exc)
 
@@ -60,13 +75,25 @@ def _git_available() -> bool:
     return shutil.which("git") is not None and (REPO_DIR / ".git").exists()
 
 
+def _is_ancestor(ancestor: str, descendant: str) -> bool:
+    rc, _, _ = _git("merge-base", "--is-ancestor", ancestor, descendant)
+    return rc == 0
+
+
+def _invalidate_local() -> None:
+    with _lock:
+        _local_cache["at"] = 0.0
+        _local_cache["state"] = None
+
+
+# ── local state ───────────────────────────────────────────────────────────────
 def local_state() -> Dict[str, object]:
-    """Where the checkout currently is. Cheap enough to call per request (cached)."""
+    """Which release this checkout is on. Cached briefly; cheap to call often."""
     if not _git_available():
         return {
             "is_git": False, "head": None, "short": None, "date": None,
-            "branch": None, "dirty": False,
-            "error": "git 未安装或本目录不是 git 仓库（ZIP 安装）",
+            "branch": None, "dirty": False, "tag": None, "ahead": 0,
+            "version": None, "error": "git is not installed or this is not a git checkout",
         }
     with _lock:
         cached = _local_cache.get("state")
@@ -77,11 +104,19 @@ def local_state() -> Dict[str, object]:
     rc_head, head, err = _git("rev-parse", "HEAD")
     if rc_head != 0:
         state = {"is_git": True, "head": None, "short": None, "date": None,
-                 "branch": None, "dirty": False, "error": f"无法读取 HEAD: {err}"}
+                 "branch": None, "dirty": False, "tag": None, "ahead": 0,
+                 "version": None, "error": f"cannot read HEAD: {err}"}
     else:
         rc_b, branch, _ = _git("rev-parse", "--abbrev-ref", "HEAD")
         rc_d, date, _ = _git("show", "-s", "--format=%cI", "HEAD")
         rc_s, dirty_out, _ = _git("status", "--porcelain")
+        rc_t, tag, _ = _git("describe", "--tags", "--match", TAG_GLOB, "--abbrev=0")
+        tag = tag if rc_t == 0 and is_release_tag(tag) else None
+        ahead = 0
+        if tag:
+            rc_n, n, _ = _git("rev-list", "--count", f"{tag}..HEAD")
+            if rc_n == 0 and n.isdigit():
+                ahead = int(n)
         state = {
             "is_git": True,
             "head": head,
@@ -89,6 +124,10 @@ def local_state() -> Dict[str, object]:
             "date": (date[:10] if rc_d == 0 else None),
             "branch": branch if rc_b == 0 else None,
             "dirty": bool(dirty_out),
+            "tag": tag,
+            "ahead": ahead,
+            # "+N" means: N commits past the last release, i.e. unreleased code.
+            "version": (tag if ahead == 0 else f"{tag}+{ahead}") if tag else None,
             "error": None,
         }
     with _lock:
@@ -97,30 +136,67 @@ def local_state() -> Dict[str, object]:
     return dict(state)
 
 
-# ── remote tip ────────────────────────────────────────────────────────────────
+# ── remote releases ───────────────────────────────────────────────────────────
+def _remote_tags(timeout: float) -> Tuple[Dict[str, str], Optional[str]]:
+    rc, out, err = _git("ls-remote", "--tags", REMOTE, timeout=timeout)
+    if rc != 0:
+        return {}, (err or f"git ls-remote failed ({rc})")
+    tags: Dict[str, str] = {}
+    for line in out.splitlines():
+        fields = line.split()
+        if len(fields) < 2 or not fields[1].startswith("refs/tags/"):
+            continue
+        sha, name = fields[0], fields[1][len("refs/tags/"):]
+        peeled = name.endswith("^{}")
+        if peeled:                      # annotated tag: prefer the commit it points at
+            name = name[:-3]
+        if not is_release_tag(name):
+            continue
+        if name not in tags or peeled:
+            tags[name] = sha
+    return tags, None
+
+
 def check_remote(force: bool = False, timeout: float = FETCH_TIMEOUT) -> Dict[str, object]:
-    """Refresh the cached remote tip. Blocking — call it from a thread, not a request."""
+    """Refresh the cached newest release. Blocking — call from a thread, not a request."""
     with _lock:
         age = time.time() - float(_remote_cache["checked_at"] or 0)
         if not force and age < CHECK_EVERY and _remote_cache["checked_at"]:
             return dict(_remote_cache)
 
     if not _git_available():
-        result = {"checked_at": time.time(), "head": None, "short": None, "ok": False,
-                  "error": "不是 git 仓库，无法检查更新"}
+        result = {"checked_at": time.time(), "ok": False,
+                  "error": "not a git checkout", "latest_tag": None,
+                  "latest_version": None, "latest_sha": None,
+                  "ff_possible": None, "already": None}
         with _lock:
             _remote_cache.update(result)
         return dict(result)
 
-    rc, out, err = _git("ls-remote", REMOTE, f"refs/heads/{BRANCH}", timeout=timeout)
-    head = out.split()[0] if rc == 0 and out else None
-    result = {
+    tags, err = _remote_tags(timeout)
+    latest = max(tags, key=lambda t: (parse_version(t), t)) if tags else None
+    result: Dict[str, object] = {
         "checked_at": time.time(),
-        "head": head,
-        "short": head[:7] if head else None,
-        "ok": rc == 0 and bool(head),
-        "error": None if rc == 0 and head else (err or "远端没有该分支"),
+        "ok": bool(latest) and err is None,
+        "error": err if latest is None else (None if latest else "no release tag on the remote"),
+        "latest_tag": latest,
+        "latest_version": latest,
+        "latest_sha": tags.get(latest) if latest else None,
+        "ff_possible": None,
+        "already": None,
     }
+    if latest:
+        local = local_state()
+        behind = (local.get("tag") is None
+                  or parse_version(latest) > parse_version(local.get("tag")))  # type: ignore[operator]
+        if behind:
+            # Make the tag's commit available so we can answer "can we ff onto it?"
+            _git("fetch", "--tags", "--quiet", REMOTE, timeout=max(60.0, timeout))
+            result["ff_possible"] = _is_ancestor("HEAD", latest)
+            result["already"] = _is_ancestor(latest, "HEAD")
+        else:
+            result["ff_possible"] = False
+            result["already"] = True
     with _lock:
         _remote_cache.update(result)
     return dict(result)
@@ -149,21 +225,22 @@ def start_background_checks() -> None:
 
 
 # ── public API ────────────────────────────────────────────────────────────────
-def _upgrade_blocker(local: Dict[str, object], remote: Dict[str, object]) -> Optional[str]:
+def _blocker(local: Dict[str, object], remote: Dict[str, object],
+             update_available: bool) -> Optional[str]:
     if not local.get("is_git"):
-        return "该安装不是 git 仓库（ZIP 安装），请手动下载新版本"
+        return "This install is not a git checkout — update it by hand"
     if local.get("error"):
         return str(local["error"])
     if local.get("branch") != BRANCH:
-        return f"当前分支是 {local.get('branch')!r}，只支持在 {BRANCH} 上升级"
+        return f"On branch {local.get('branch')!r}; releases are installed on {BRANCH}"
     if local.get("dirty"):
-        return "工作区有未提交的改动，请先提交或 stash 后再升级"
+        return "Working tree has uncommitted changes"
     if not remote.get("checked_at"):
-        return "尚未完成版本检查"
+        return "The version check has not run yet"
     if not remote.get("ok"):
-        return f"无法连接远端仓库：{remote.get('error') or '未知错误'}"
-    if local.get("head") == remote.get("head"):
-        return None  # 已是最新，由 update_available 表达
+        return f"Cannot reach the remote: {remote.get('error')}"
+    if update_available and remote.get("ff_possible") is False:
+        return "Local commits are not part of that release — resolve by hand"
     return None
 
 
@@ -171,17 +248,18 @@ def status() -> Dict[str, object]:
     """Everything the dashboard needs to render the version pill."""
     local = local_state()
     remote = remote_state()
+    latest = remote.get("latest_tag")
     update_available = None
-    if local.get("is_git") and remote.get("ok") and local.get("head") and remote.get("head"):
-        update_available = local["head"] != remote["head"]
-    blocker = _upgrade_blocker(local, remote)
+    if latest:
+        update_available = bool(local.get("tag") != latest and not remote.get("already"))
+    blocker = _blocker(local, remote, bool(update_available))
     return {
-        "current": local.get("short"),
+        "current": local.get("version"),
         "current_date": local.get("date"),
         "branch": local.get("branch"),
         "dirty": bool(local.get("dirty")),
         "is_git": bool(local.get("is_git")),
-        "latest": remote.get("short"),
+        "latest": latest,
         "update_available": update_available,
         "checked_at": remote.get("checked_at") or None,
         "check_error": remote.get("error") if not remote.get("ok") else None,
@@ -191,37 +269,44 @@ def status() -> Dict[str, object]:
 
 
 def upgrade() -> Dict[str, object]:
-    """Fast-forward to the remote tip. Refuses anything that could lose work."""
+    """Fast-forward onto the newest release tag. Refuses anything that loses work."""
     local = local_state()
     remote = remote_state()
-    if not remote.get("ok") or not remote.get("checked_at"):
+    if not remote.get("checked_at") or not remote.get("ok"):
         remote = check_remote(force=True, timeout=30)
-    blocker = _upgrade_blocker(local, remote)
-    if blocker:
-        return {"ok": False, "error": blocker}
-    if local.get("head") == remote.get("head"):
-        return {"ok": True, "from": local.get("short"), "to": local.get("short"),
+    latest = remote.get("latest_tag")
+    if not latest:
+        return {"ok": False, "error": "No release tag found on the remote"}
+
+    update_available = bool(local.get("tag") != latest and not remote.get("already"))
+    if not update_available:
+        return {"ok": True, "from": local.get("version"), "to": local.get("version"),
                 "up_to_date": True}
 
-    rc, out, err = _git("fetch", REMOTE, BRANCH, timeout=60)
-    if rc != 0:
-        return {"ok": False, "error": f"git fetch 失败：{err or out}"}
+    blocker = _blocker(local, remote, True)
+    if blocker:
+        return {"ok": False, "error": blocker}
 
-    rc, out, err = _git("merge", "--ff-only", f"{REMOTE}/{BRANCH}", timeout=60)
+    rc, out, err = _git("fetch", "--tags", "--quiet", REMOTE, timeout=60)
     if rc != 0:
-        detail = err or out
+        return {"ok": False, "error": f"git fetch failed: {err or out}"}
+    rc, _, _ = _git("rev-parse", "-q", "--verify", f"refs/tags/{latest}^{{commit}}")
+    if rc != 0:
+        return {"ok": False, "error": f"Release tag {latest} is missing after fetch"}
+    if not _is_ancestor("HEAD", latest):
         return {"ok": False,
-                "error": f"无法快进合并（本地可能有分叉提交），请在安装目录手动处理：{detail}"}
+                "error": f"HEAD is not an ancestor of {latest}; upgrading would drop local commits"}
 
-    # The merge output itself is noise for the UI; report the new position.
-    with _lock:
-        _local_cache["at"] = 0.0
-        _local_cache["state"] = None
+    rc, out, err = _git("merge", "--ff-only", latest, timeout=60)
+    if rc != 0:
+        return {"ok": False, "error": f"Fast-forward failed: {err or out}"}
+
+    _invalidate_local()
     after = local_state()
     check_remote(force=True)
     return {
         "ok": True,
-        "from": local.get("short"),
-        "to": after.get("short"),
-        "up_to_date": local.get("head") == after.get("head"),
+        "from": local.get("version"),
+        "to": after.get("version"),
+        "up_to_date": False,
     }

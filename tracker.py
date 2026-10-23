@@ -1111,8 +1111,9 @@ def build_report() -> str:
     try:
         import updater as _updater
         _v = _updater.local_state()
-        add(f"version       : {_v.get('short') or 'unknown'}"
-            f" ({_v.get('date') or 'n/a'}, branch {_v.get('branch') or '?'}"
+        add(f"version       : {_v.get('version') or 'untagged'}"
+            f" ({_v.get('short') or '?'}, {_v.get('date') or 'n/a'},"
+            f" branch {_v.get('branch') or '?'}"
             f"{', dirty' if _v.get('dirty') else ''})")
     except Exception as e:
         add(f"version       : unavailable ({type(e).__name__}: {e})")

@@ -395,10 +395,10 @@ def api_version():
 @app.route("/api/upgrade", methods=["POST"])
 def api_upgrade():
     if not _is_local_request():
-        return jsonify({"ok": False, "error": "只允许在安装机上操作升级"}), 403
+        return jsonify({"ok": False, "error": "Upgrades are only allowed from the install machine"}), 403
     payload = request.get_json(silent=True) or {}
     if payload.get("token") != UPGRADE_TOKEN:
-        return jsonify({"ok": False, "error": "升级令牌无效，请刷新页面后重试"}), 403
+        return jsonify({"ok": False, "error": "Invalid upgrade token — reload the page and retry"}), 403
 
     result = updater.upgrade()
     tracker.log_event("INFO", "upgrade {} -> {} ok={} {}".format(
@@ -517,10 +517,10 @@ if __name__ == "__main__":
     print(f"  Local  → http://localhost:{port}")
     print(f"  LAN    → http://{lan_ip}:{port}")
     _ver = updater.local_state()
-    print(f"  Version → {_ver.get('short') or 'unknown'}"
-          f" ({_ver.get('date') or 'n/a'}, branch {_ver.get('branch') or '?'})")
+    print(f"  Version → {_ver.get('version') or 'untagged'}"
+          f" ({_ver.get('short') or '?'}, branch {_ver.get('branch') or '?'})")
     if not _ver.get("is_git"):
-        print("  Update  → 不可用（不是 git 仓库），请手动升级")
+        print("  Update  → unavailable (not a git checkout), update by hand")
     # Bring an older database up to date now, so a schema problem shows up here
     # rather than as a 500 on the first page load.
     try:
