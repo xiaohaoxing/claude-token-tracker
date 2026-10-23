@@ -195,6 +195,23 @@ python3 stats.py daily [--days N]
 
 Removes the hook from `~/.claude/settings.json`. The database at `~/.claude/token-tracker/token_stats.db` is preserved.
 
+## Pricing
+
+Costs are computed locally from a data file — `pricing.json` — so a price change never needs a code change:
+
+- **One entry per model**: the name patterns it matches, its currency, and either flat `rates` or a `peak` / `idle` pair.
+- **Time-of-day pricing**: some vendors charge by the hour. DeepSeek bills peak (Beijing time, weekdays 09:00-12:00 and 14:00-18:00) at twice the idle rate, so every call is priced with its own timestamp. Weekends and Chinese statutory holidays are idle; the holiday dates live in `pricing.json` and need extending once a year.
+- **Currencies**: prices are written exactly as the vendor publishes them (DeepSeek in CNY) and converted to the database's USD with `fx`. Update `fx` when the rate drifts.
+- **Unmatched model names** are billed at the `fallback` model and listed as `unpriced` by `python3 tracker.py --doctor`, so a third-party model never silently distorts the totals.
+
+Editing `pricing.json` reprices stored history automatically on the next start. To do it explicitly:
+
+```bash
+python3 tracker.py --reprice
+```
+
+The shipped book covers Anthropic Claude rates (USD) and DeepSeek `deepseek-flash` / `deepseek-v4-pro` rates (CNY, peak/idle); sources are recorded inside the file.
+
 ## Database Location
 
 Default: `~/.claude/token-tracker/token_stats.db`
@@ -210,6 +227,8 @@ CLAUDE_TRACKER_DB=/path/to/custom.db python3 server.py
 ```
 claude-token-tracker/
 ├── tracker.py        # Stop hook script + backfill/catch-up modes
+├── pricing.py        # Price-book loader: model matching + peak/idle windows
+├── pricing.json      # The price book itself (edit this to fix a price)
 ├── hook.sh           # portable launcher the Stop hook actually runs
 ├── stats.py          # CLI query tool
 ├── server.py         # Flask web dashboard

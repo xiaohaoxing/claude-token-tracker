@@ -185,6 +185,23 @@ python3 stats.py daily          # 每日明细
 
 仅移除 `~/.claude/settings.json` 中的 hook 注册，数据库文件 `~/.claude/token-tracker/token_stats.db` 会保留。
 
+## 价格配置
+
+费用在本地按数据文件 `pricing.json` 计算，改价格不需要改代码：
+
+- **一个模型一条记录**：匹配用的模型名片段、币种，以及平价的 `rates` 或 `peak` / `idle` 两档价格。
+- **分时价格**：部分厂商按时段计费。DeepSeek 高峰时段（北京时间工作日 09:00-12:00、14:00-18:00）价格是低峰的两倍，因此每条调用都按它自己的时间戳判定档位；周末与中国法定节假日全天按低峰计。节假日日期维护在 `pricing.json` 里，每年需要补一次。
+- **币种**：价格按厂商公布的原币种书写（DeepSeek 为人民币），入库前按 `fx` 折算成美元；汇率变动时改 `fx` 即可。
+- **未匹配的模型名**按 `fallback` 模型计价，并在 `python3 tracker.py --doctor` 的 `unpriced` 一行列出，不会悄悄污染总额。
+
+修改 `pricing.json` 后，下次启动会自动重算历史数据；也可以手动执行：
+
+```bash
+python3 tracker.py --reprice
+```
+
+当前内置 Anthropic Claude（美元）与 DeepSeek `deepseek-flash` / `deepseek-v4-pro`（人民币、分时）价格，来源记录在文件内。
+
 ## 数据库路径
 
 默认位置：`~/.claude/token-tracker/token_stats.db`
@@ -200,6 +217,8 @@ CLAUDE_TRACKER_DB=/path/to/custom.db python3 server.py
 ```
 claude-token-tracker/
 ├── tracker.py        # Stop hook 脚本 + 历史补录 / catch-up 兜底
+├── pricing.py        # 价格表加载：模型匹配 + 高峰/低峰时段
+├── pricing.json      # 价格表本体（改价格就改这里）
 ├── hook.sh           # Stop hook 实际执行的便携启动器
 ├── stats.py          # 命令行查询工具
 ├── server.py         # Flask Web 看板

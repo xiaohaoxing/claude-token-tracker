@@ -25,6 +25,8 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pricing
+
 # ── Interpreter guard ─────────────────────────────────────────────────────────
 # The Stop hook runs whatever `python3` resolves to on the user's PATH, and that
 # differs from machine to machine. Never die with an obscure SyntaxError or
@@ -107,32 +109,64 @@ def log_exception(context: str, exc: BaseException, limit: int = 2000) -> None:
         detail = detail[:limit] + " …[truncated]"
     log_event("ERROR", f"{context}: {detail}")
 
-# ── Pricing table (USD per 1M tokens) ────────────────────────────────────────
-PRICING: dict[str, dict[str, float]] = {
-    "claude-opus-4-7":    {"input": 15.00, "output": 75.00, "cache_write": 18.75, "cache_read": 1.50},
-    "claude-opus-4-6":    {"input": 15.00, "output": 75.00, "cache_write": 18.75, "cache_read": 1.50},
-    "claude-sonnet-4-6":  {"input":  3.00, "output": 15.00, "cache_write":  3.75, "cache_read": 0.30},
-    "claude-haiku-4-5":   {"input":  0.80, "output":  4.00, "cache_write":  1.00, "cache_read": 0.08},
-    "claude-3-5-sonnet":  {"input":  3.00, "output": 15.00, "cache_write":  3.75, "cache_read": 0.30},
-    "claude-3-5-haiku":   {"input":  0.80, "output":  4.00, "cache_write":  1.00, "cache_read": 0.08},
-    "claude-3-opus":      {"input": 15.00, "output": 75.00, "cache_write": 18.75, "cache_read": 1.50},
-}
+# ── Pricing ──────────────────────────────────────────────────────────────────
+# The price book itself is data (pricing.json) so rates can be corrected
+# without a code change, and a model may have different peak / idle prices
+# depending on when the call happened. pricing.py owns the matching rules.
+_PRICING_WARNED = False
 
-def _get_pricing(model: str) -> dict[str, float]:
-    if model:
-        for key, p in PRICING.items():
-            if key in model:
-                return p
-    return {"input": 3.00, "output": 15.00, "cache_write": 3.75, "cache_read": 0.30}
 
-def calc_cost(model: str, inp: int, out: int, cache_write: int, cache_read: int) -> float:
-    p = _get_pricing(model)
-    return (
-        inp        * p["input"]       / 1_000_000
-        + out      * p["output"]      / 1_000_000
-        + cache_write * p["cache_write"] / 1_000_000
-        + cache_read  * p["cache_read"]  / 1_000_000
-    )
+def calc_cost(model: str, inp: int, out: int, cache_write: int, cache_read: int,
+              when=None) -> float:
+    """Cost in USD. `when` is the API call timestamp (peak/idle pricing)."""
+    return pricing.DEFAULT.cost(model, inp, out, cache_write, cache_read, when=when)
+
+
+def reprice_all(con: sqlite3.Connection) -> int:
+    """
+    Recompute every stored api_call cost from the current price book.
+
+    Called once per price-book change (see migrate_pricing) and available as
+    `--reprice`, so corrections to prices or the CNY/USD rate also fix history
+    instead of leaving a mixed database behind.
+    """
+    rows = con.execute("""
+        SELECT id, model, timestamp, input_tokens, output_tokens,
+               cache_creation_tokens, cache_read_tokens, cost_usd
+        FROM api_calls
+    """).fetchall()
+    updates = []
+    for r in rows:
+        new = calc_cost(r["model"], r["input_tokens"] or 0, r["output_tokens"] or 0,
+                        r["cache_creation_tokens"] or 0, r["cache_read_tokens"] or 0,
+                        when=r["timestamp"])
+        if abs(new - (r["cost_usd"] or 0.0)) > 1e-9:
+            updates.append((new, r["id"]))
+    if not updates:
+        return 0
+    con.executemany("UPDATE api_calls SET cost_usd = ? WHERE id = ?", updates)
+    con.execute("""
+        UPDATE sessions SET total_cost_usd = COALESCE((
+            SELECT SUM(cost_usd) FROM api_calls
+            WHERE api_calls.session_id = sessions.session_id
+        ), 0)
+    """)
+    dates = [r[0] for r in con.execute(
+        "SELECT DISTINCT substr(timestamp, 1, 10) FROM api_calls WHERE timestamp <> ''")]
+    rebuild_daily_summary(con, dates)
+    con.commit()
+    return len(updates)
+
+
+def migrate_pricing(con: sqlite3.Connection) -> None:
+    """Reprice when the price book changed; no-op on every other startup."""
+    signature = pricing.DEFAULT.signature()
+    if get_meta(con, "pricing_signature") == signature:
+        return
+    changed = reprice_all(con)
+    set_meta(con, "pricing_signature", signature)
+    con.commit()
+    log_event("INFO", f"pricing migrate signature={signature} rows_repriced={changed}")
 
 # ── Schema ────────────────────────────────────────────────────────────────────
 SCHEMA = """
@@ -288,7 +322,7 @@ def ensure_schema(con: sqlite3.Connection) -> None:
     con.commit()
 
 
-def open_db() -> sqlite3.Connection:
+def open_db(migrate: bool = True) -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     # The hook, the CLI and the dashboard can all write at the same time now, so
     # wait for a busy database instead of failing instantly.
@@ -296,6 +330,13 @@ def open_db() -> sqlite3.Connection:
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA busy_timeout = 15000")
     ensure_schema(con)
+    global _PRICING_WARNED
+    if pricing.DEFAULT.error and not _PRICING_WARNED:
+        _PRICING_WARNED = True
+        log_event("WARN", f"pricing book unusable ({pricing.DEFAULT.error}); "
+                          f"falling back to embedded Sonnet rates")
+    if migrate:
+        migrate_pricing(con)
     return con
 
 
@@ -445,6 +486,7 @@ def parse_transcript(path: str) -> dict:
         message_id  = msg.get("id", "")
         stop_reason = msg.get("stop_reason", "")
         stu         = usage.get("server_tool_use", {})
+        timestamp   = m.get("timestamp", "")
 
         inp          = usage.get("input_tokens", 0) or 0
         out          = usage.get("output_tokens", 0) or 0
@@ -456,7 +498,8 @@ def parse_transcript(path: str) -> dict:
         service_tier = usage.get("service_tier", "")
         speed        = usage.get("speed", "")
 
-        cost = calc_cost(model, inp, out, cache_create, cache_read)
+        # `timestamp` matters: time-of-day models (DeepSeek) bill peak vs idle.
+        cost = calc_cost(model, inp, out, cache_create, cache_read, when=timestamp)
 
         if model:
             models_seen.add(model)
@@ -806,6 +849,22 @@ def catch_up(con: sqlite3.Connection, force: bool = False,
     return ingested
 
 
+def run_reprice() -> None:
+    """Recompute every stored cost from the current price book (--reprice)."""
+    con = open_db(migrate=False)
+    try:
+        changed = reprice_all(con)
+        set_meta(con, "pricing_signature", pricing.DEFAULT.signature())
+        con.commit()
+        total = con.execute("SELECT COALESCE(SUM(cost_usd), 0) FROM api_calls").fetchone()[0]
+    finally:
+        con.close()
+    log_event("INFO", f"reprice signature={pricing.DEFAULT.signature()} rows={changed}")
+    print(f"Pricing book  : {pricing.DEFAULT.version} ({pricing.DEFAULT.signature()})")
+    print(f"Rows repriced : {changed}")
+    print(f"Total cost    : ${total:.4f}")
+
+
 def run_catch_up(force: bool = True, projects_dir: Path | str | None = None) -> int:
     """Open the DB and run one catch-up scan (used by --catch-up and the dashboard)."""
     con = open_db()
@@ -982,6 +1041,46 @@ def _db_report() -> list[str]:
     return lines
 
 
+def _pricing_report() -> list[str]:
+    """Which price book is in force, and which stored models it does not know."""
+    info = pricing.DEFAULT.summary()
+    lines = [f"book          : {info['path']}",
+             f"version       : {info['version']} (signature {info['signature']})",
+             f"models        : {len(info['models'])} — {', '.join(info['models'])}",
+             f"time-of-day   : {', '.join(info['timed_models']) or '(none)'}",
+             f"fallback      : {info['fallback']} (used for unmatched model names)"]
+    fx = info.get("fx") or {}
+    if fx:
+        lines.append("fx            : "
+                     + ", ".join(f"1 {pricing.DEFAULT.base_currency} = {v} {k}"
+                                 for k, v in fx.items()))
+    if info.get("error"):
+        lines.append(f"  ERROR       : {info['error']} — using embedded rates")
+    for name, url in (pricing.DEFAULT.sources or {}).items():
+        lines.append(f"source        : {name} {url}")
+    if not DB_PATH.exists():
+        return lines
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=5)
+        con.execute("PRAGMA query_only = ON")
+        rows = con.execute(
+            "SELECT model, COUNT(*) FROM api_calls GROUP BY model").fetchall()
+        unknown = [(m or "(empty)", n) for m, n in rows if not pricing.DEFAULT.known(m or "")]
+        if unknown:
+            lines.append("unpriced      : "
+                         + ", ".join(f"{m} ×{n}" for m, n in unknown))
+            lines.append("                these are billed at the fallback model — "
+                         "add them to pricing.json if the number matters")
+    except Exception as e:
+        lines.append(f"  query failed: {type(e).__name__}: {e}")
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+    return lines
+
+
 def build_report() -> str:
     out: list[str] = []
 
@@ -1028,6 +1127,10 @@ def build_report() -> str:
 
     section("Database")
     for line in _db_report():
+        add(line)
+
+    section("Pricing")
+    for line in _pricing_report():
         add(line)
 
     tlog = _tail(LOG_PATH)
@@ -1183,10 +1286,14 @@ if __name__ == "__main__":
                         help="Print a shareable diagnostics report (no prompts or secrets)")
     parser.add_argument("--out", metavar="FILE",
                         help="With --doctor: write the report to FILE instead of stdout")
+    parser.add_argument("--reprice", action="store_true",
+                        help="Recompute every stored cost from pricing.json (after a price edit)")
     args = parser.parse_args()
 
     if args.doctor:
         run_doctor(args.out)
+    elif args.reprice:
+        run_reprice()
     elif args.backfill:
         run_backfill(args.backfill)
     elif args.catch_up:

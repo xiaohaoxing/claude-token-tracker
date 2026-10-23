@@ -1,0 +1,109 @@
+{
+  "version": "2026-10-23",
+  "notes": [
+    "Prices are per 1,000,000 tokens in the model's own currency.",
+    "Each model has either flat 'rates', or a 'peak' / 'idle' pair plus a 'peak_window' key.",
+    "fx maps a currency to how many units 1 USD buys; costs are stored in USD.",
+    "DeepSeek peak: Beijing time, Mon-Fri 09:00-12:00 and 14:00-18:00, excluding Chinese statutory holidays; every other hour is idle and costs half.",
+    "Statutory holidays are listed explicitly — add next year's State Council dates, otherwise holidays get priced as peak.",
+    "DeepSeek bills cache writes as ordinary cache-miss input, so cache_write == input_miss there.",
+    "A model name that matches no entry is billed at 'fallback' and reported as 'unpriced' by --doctor."
+  ],
+  "sources": {
+    "deepseek": "https://api-docs.deepseek.com/zh-cn/quick_start/pricing/",
+    "cn_holidays_2026": "https://www.gov.cn/zhengce/content/202511/content_7047090.htm"
+  },
+  "fx": {
+    "base": "USD",
+    "CNY": 7.1
+  },
+  "fallback": "claude-sonnet-4-6",
+  "peak_windows": {
+    "cn_business": {
+      "label": "北京时间工作日 09:00-12:00 / 14:00-18:00（法定节假日除外）",
+      "utc_offset_hours": 8,
+      "weekdays": [1, 2, 3, 4, 5],
+      "ranges": [["09:00", "12:00"], ["14:00", "18:00"]],
+      "holidays": [
+        "2026-01-01", "2026-01-02", "2026-01-03",
+        "2026-02-15", "2026-02-16", "2026-02-17", "2026-02-18",
+        "2026-02-19", "2026-02-20", "2026-02-21", "2026-02-22", "2026-02-23",
+        "2026-04-04", "2026-04-05", "2026-04-06",
+        "2026-05-01", "2026-05-02", "2026-05-03", "2026-05-04", "2026-05-05",
+        "2026-06-19", "2026-06-20", "2026-06-21",
+        "2026-09-25", "2026-09-26", "2026-09-27",
+        "2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04",
+        "2026-10-05", "2026-10-06", "2026-10-07"
+      ]
+    }
+  },
+  "models": [
+    {
+      "id": "deepseek-v4-pro",
+      "provider": "deepseek",
+      "match": ["deepseek-v4-pro"],
+      "currency": "CNY",
+      "peak_window": "cn_business",
+      "peak": {"input_miss": 9.0, "input_hit": 0.30, "cache_write": 9.0, "output": 27.0},
+      "idle": {"input_miss": 4.5, "input_hit": 0.15, "cache_write": 4.5, "output": 13.5}
+    },
+    {
+      "id": "deepseek-flash",
+      "provider": "deepseek",
+      "match": ["deepseek-flash", "deepseek-v4-flash"],
+      "currency": "CNY",
+      "peak_window": "cn_business",
+      "peak": {"input_miss": 2.0, "input_hit": 0.04, "cache_write": 2.0, "output": 8.0},
+      "idle": {"input_miss": 1.0, "input_hit": 0.02, "cache_write": 1.0, "output": 4.0}
+    },
+    {
+      "id": "claude-opus-4-7",
+      "provider": "anthropic",
+      "match": ["claude-opus-4-7"],
+      "currency": "USD",
+      "rates": {"input_miss": 15.00, "input_hit": 1.50, "cache_write": 18.75, "output": 75.00}
+    },
+    {
+      "id": "claude-opus-4-6",
+      "provider": "anthropic",
+      "match": ["claude-opus-4-6"],
+      "currency": "USD",
+      "rates": {"input_miss": 15.00, "input_hit": 1.50, "cache_write": 18.75, "output": 75.00}
+    },
+    {
+      "id": "claude-sonnet-4-6",
+      "provider": "anthropic",
+      "match": ["claude-sonnet-4-6"],
+      "currency": "USD",
+      "rates": {"input_miss": 3.00, "input_hit": 0.30, "cache_write": 3.75, "output": 15.00}
+    },
+    {
+      "id": "claude-haiku-4-5",
+      "provider": "anthropic",
+      "match": ["claude-haiku-4-5"],
+      "currency": "USD",
+      "rates": {"input_miss": 0.80, "input_hit": 0.08, "cache_write": 1.00, "output": 4.00}
+    },
+    {
+      "id": "claude-3-5-sonnet",
+      "provider": "anthropic",
+      "match": ["claude-3-5-sonnet"],
+      "currency": "USD",
+      "rates": {"input_miss": 3.00, "input_hit": 0.30, "cache_write": 3.75, "output": 15.00}
+    },
+    {
+      "id": "claude-3-5-haiku",
+      "provider": "anthropic",
+      "match": ["claude-3-5-haiku"],
+      "currency": "USD",
+      "rates": {"input_miss": 0.80, "input_hit": 0.08, "cache_write": 1.00, "output": 4.00}
+    },
+    {
+      "id": "claude-3-opus",
+      "provider": "anthropic",
+      "match": ["claude-3-opus"],
+      "currency": "USD",
+      "rates": {"input_miss": 15.00, "input_hit": 1.50, "cache_write": 18.75, "output": 75.00}
+    }
+  ]
+}
