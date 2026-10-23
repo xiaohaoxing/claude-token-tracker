@@ -158,10 +158,10 @@ def _upgrade_blocker(local: Dict[str, object], remote: Dict[str, object]) -> Opt
         return f"当前分支是 {local.get('branch')!r}，只支持在 {BRANCH} 上升级"
     if local.get("dirty"):
         return "工作区有未提交的改动，请先提交或 stash 后再升级"
-    if not remote.get("ok"):
-        return f"无法连接远端仓库：{remote.get('error') or '未知错误'}"
     if not remote.get("checked_at"):
         return "尚未完成版本检查"
+    if not remote.get("ok"):
+        return f"无法连接远端仓库：{remote.get('error') or '未知错误'}"
     if local.get("head") == remote.get("head"):
         return None  # 已是最新，由 update_available 表达
     return None
