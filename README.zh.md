@@ -137,6 +137,25 @@ python3 server.py 8080     # 自定义端口
 | 工具 | 各工具的调用次数、报错率、平均输入/输出大小 |
 | 模型 | 各模型的 token 用量和费用占比 |
 
+**版本与一键升级**
+
+看板右上角显示当前运行的 commit。远端 `main` 有新提交时会提示，并且在**安装机**上
+显示「Update to `<sha>`」按钮：点击后执行 `git merge --ff-only` 快进、原地重启看板，
+页面自动刷新。
+
+考虑到这个接口会执行 git 并重启一个监听 `0.0.0.0` 的服务，限制得很紧：
+
+- 只有来自安装机本身的请求才能升级；局域网访问者只看得到版本和「有新版本」提示，
+  按钮不会出现，绕过页面直接 POST 也会被 403 拒绝；
+- POST 必须是 JSON 并携带 `/api/version` 下发的、每次启动都会变的令牌 —— 其它源的
+  页面既读不到该响应（没有 CORS），也无法发出 JSON 请求（预检必然失败）；
+- 工作区有未提交改动、不在 `main` 分支、非 git 安装（ZIP）、历史分叉，一律拒绝，
+  不会丢本地改动；
+- 远端版本由后台线程检查，页面加载永远不等待网络（`git ls-remote` 在本机约需 5 秒）。
+
+可用 `CLAUDE_TRACKER_UPDATE_CHECK=<秒>`（默认 900）和
+`CLAUDE_TRACKER_GIT_TIMEOUT=<秒>`（默认 20）调整。
+
 ## 新会话什么时候出现？
 
 数据通过 **Stop hook** 写入，即每次 Claude Code 完成一条响应后触发。
@@ -226,6 +245,7 @@ claude-token-tracker/
 ├── hook.sh           # Stop hook 实际执行的便携启动器
 ├── stats.py          # 命令行查询工具
 ├── server.py         # Flask Web 看板
+├── updater.py        # 版本检查 + 一键升级（git 操作）
 ├── templates/
 │   └── index.html    # 单页前端（Tailwind + Chart.js）
 ├── static/

@@ -146,6 +146,29 @@ Also accessible from other devices on the same LAN: `http://<your-lan-ip>:5001`
 | Tools | How often each tool was called, error rates, average input/output sizes |
 | Models | Per-model token counts and cost |
 
+**Version & one-click upgrade**
+
+The header shows the commit you are running. When the remote `main` is ahead,
+the dashboard says so and — if you are on the install machine — offers an
+**Update to `<sha>`** button. It fast-forwards the checkout (`git merge
+--ff-only`) and restarts the dashboard in place; the page reloads itself.
+
+This is deliberately narrow, because the endpoint runs git and restarts a
+server that listens on `0.0.0.0`:
+
+- only requests originating on the install machine can upgrade. Visitors from
+  the LAN see the version and an "update available" hint, nothing clickable;
+- the POST must be JSON and carry a per-process token from `/api/version`,
+  which a page on another origin can neither read (no CORS) nor replay
+  (a JSON request would need a preflight that fails);
+- it refuses dirty worktrees, branches other than `main`, ZIP installs (no
+  `.git`) and diverged history, so uncommitted work can never be lost;
+- the remote is checked by a background thread, so page loads never wait on the
+  network (`git ls-remote` takes a few seconds).
+
+Tunable with `CLAUDE_TRACKER_UPDATE_CHECK=<seconds>` (default 900) and
+`CLAUDE_TRACKER_GIT_TIMEOUT=<seconds>` (default 20).
+
 ## When does a new session appear?
 
 Sessions are recorded by a **Stop hook** — it fires when Claude Code finishes a response.
@@ -238,6 +261,7 @@ claude-token-tracker/
 ├── hook.sh           # portable launcher the Stop hook actually runs
 ├── stats.py          # CLI query tool
 ├── server.py         # Flask web dashboard
+├── updater.py        # Version check + one-click upgrade (git plumbing)
 ├── templates/
 │   └── index.html    # Single-page frontend (Tailwind + Chart.js)
 ├── static/

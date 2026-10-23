@@ -760,10 +760,14 @@ function renderVersion(v) {
         class="text-xs bg-brand hover:bg-brand-dark px-3 py-1.5 rounded-lg text-white font-medium">
         Update to ${v.latest}
       </button>`
-  } else if (v.update_available) {
+  } else if (v.update_available && v.local) {
     el.className = 'text-xs text-amber-400'
     el.title = v.blocker || ''
-    el.textContent = `Update ${v.latest} available — run git pull`
+    el.textContent = `Update ${v.latest} available — ${v.blocker || 'run git pull'}`
+  } else if (v.update_available) {
+    el.className = 'text-xs text-slate-500'
+    el.title = '升级需要在安装机上操作'
+    el.textContent = `Update ${v.latest} available`
   } else {
     el.className = 'text-xs text-slate-600'
     el.textContent = v.is_git ? cur : 'manual install'

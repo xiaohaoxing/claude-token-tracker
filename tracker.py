@@ -1108,8 +1108,16 @@ def build_report() -> str:
     section("Installation")
     repo = Path(__file__).resolve().parent
     add(f"repo dir      : {repo}")
+    try:
+        import updater as _updater
+        _v = _updater.local_state()
+        add(f"version       : {_v.get('short') or 'unknown'}"
+            f" ({_v.get('date') or 'n/a'}, branch {_v.get('branch') or '?'}"
+            f"{', dirty' if _v.get('dirty') else ''})")
+    except Exception as e:
+        add(f"version       : unavailable ({type(e).__name__}: {e})")
     for name in ("tracker.py", "hook.sh", "server.py", "stats.py", "install.sh",
-                 "templates/index.html"):
+                 "pricing.json", "pricing.py", "updater.py", "templates/index.html"):
         p = repo / name
         if not p.exists():
             add(f"  {name:<20}: MISSING")
