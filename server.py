@@ -9,6 +9,7 @@ import logging
 import os
 import socket
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -409,19 +410,50 @@ def api_upgrade():
     return jsonify(result), (200 if result.get("ok") else 409)
 
 
+def _wait_for_port(port: int, timeout: float = 20.0) -> bool:
+    """Block until we can bind `port` ourselves — i.e. the old process let go."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind(("0.0.0.0", port))
+            return True
+        except OSError:
+            time.sleep(0.25)
+        finally:
+            probe.close()
+    return False
+
+
 def _restart_for_upgrade() -> None:
-    """Replace this process with a fresh one, so the new code is what runs."""
+    """
+    Restart onto the new code.
+
+    execv() looked obvious but inherits the listening socket, so the fresh image
+    failed to bind its own port. A detached child with close_fds=True starts with
+    a clean descriptor table, waits for this process to exit (see _wait_for_port)
+    and then serves; this process exits. The child keeps the same stdout/stderr,
+    so nohup logging continues.
+    """
     try:
         sys.stdout.flush()
         sys.stderr.flush()
     except Exception:
         pass
+    env = dict(os.environ)
+    env["CLAUDE_TRACKER_WAIT_PORT"] = str(_PORT)
     try:
-        tracker.log_event("INFO", f"upgrade restart pid={os.getpid()} port={_PORT}")
-        os.execv(sys.executable, [sys.executable, os.path.abspath(__file__), str(_PORT)])
+        child = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), str(_PORT)],
+            stdin=subprocess.DEVNULL, stdout=sys.stdout, stderr=sys.stderr,
+            close_fds=True, start_new_session=True, env=env,
+        )
     except Exception as e:
         tracker.log_exception("upgrade restart", e)
-        os._exit(1)
+        return  # keep serving the old code rather than going dark
+    tracker.log_event("INFO", f"upgrade restart old={os.getpid()} new={child.pid} port={_PORT}")
+    os._exit(0)
 
 
 # ── Catch-up safety net ───────────────────────────────────────────────────────
@@ -503,6 +535,11 @@ if __name__ == "__main__":
         tracker.log_exception("dashboard startup schema check", e)
     tracker.log_event("INFO", f"dashboard start port={port} pid={os.getpid()} "
                               f"db={DB_PATH}")
+    _wait_port = os.environ.pop("CLAUDE_TRACKER_WAIT_PORT", "")
+    if _wait_port:
+        print(f"  Restart→ waiting for the previous process to release port {_wait_port}")
+        if not _wait_for_port(int(_wait_port)):
+            print(f"  Restart→ port {_wait_port} still busy, trying anyway")
     start_catchup_thread()
     updater.start_background_checks()
     app.run(host="0.0.0.0", port=port, debug=False)
