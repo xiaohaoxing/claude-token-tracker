@@ -43,6 +43,8 @@ def open_db() -> sqlite3.Connection:
     con.execute("PRAGMA busy_timeout = 15000")
     # Bring an older database up to date, exactly like the hook and the dashboard.
     tracker.ensure_schema(con)
+    # …including costs computed by an older price book.
+    tracker.migrate_pricing(con)
     return con
 
 

@@ -81,6 +81,12 @@ The installer is safe to re-run and does everything for you:
 Nothing has to be migrated by hand — new database tables are created
 automatically the first time any part of the tool runs (hook, CLI or dashboard).
 
+Price corrections apply to old data too: the first run after an upgrade
+recomputes the cost of every stored API call from `pricing.json` (tokens and
+timestamps are kept, only the price changes), so a mispriced model shows its
+corrected total immediately instead of only for new sessions. Editing
+`pricing.json` later triggers the same pass.
+
 Notes:
 
 - Local changes in the checkout? `git stash && git pull && ./install.sh`

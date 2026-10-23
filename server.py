@@ -407,6 +407,9 @@ if __name__ == "__main__":
     # rather than as a 500 on the first page load.
     try:
         _con = get_db()
+        # An upgraded install must show corrected prices immediately, not five
+        # minutes later when the catch-up thread happens to run.
+        tracker.migrate_pricing(_con)
         _con.close()
         print("  DB     → schema up to date")
     except Exception as e:
