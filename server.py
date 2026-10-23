@@ -9,6 +9,7 @@ import logging
 import os
 import socket
 import sqlite3
+import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -20,6 +21,7 @@ from flask import Flask, jsonify, render_template, request
 # Reused for the catch-up safety net (see start_catchup_thread below).
 # tracker.py lives next to this file, so a plain import works.
 import tracker
+import updater
 
 DB_PATH = Path(os.environ.get("CLAUDE_TRACKER_DB",
                Path.home() / ".claude" / "token-tracker" / "token_stats.db"))
@@ -343,6 +345,85 @@ def filters():
     })
 
 
+# ── Version & one-click upgrade ───────────────────────────────────────────────
+# The dashboard executes `git pull` for the user, so the endpoint is fenced in:
+#   * only requests originating on this machine may call it — the dashboard
+#     listens on 0.0.0.0, so a LAN neighbour must never be able to update code;
+#   * the body must be JSON and carry the per-process token handed out by
+#     /api/version. A cross-site page cannot read that response (no CORS) and
+#     cannot send application/json without a preflight it would fail, so a
+#     drive-by CSRF cannot restart the server under a new version.
+UPGRADE_TOKEN = os.urandom(16).hex()
+_PORT = 5001
+_local_addrs_cache: list = []
+
+
+def _local_addrs() -> list:
+    global _local_addrs_cache
+    if not _local_addrs_cache:
+        addrs = ["127.0.0.1", "::1"]
+        for probe in (lambda: socket.gethostbyname(socket.gethostname()), _lan_ip):
+            try:
+                ip = probe()
+                if ip and ip not in addrs:
+                    addrs.append(ip)
+            except Exception:
+                pass
+        _local_addrs_cache = addrs
+    return _local_addrs_cache
+
+
+def _is_local_request() -> bool:
+    addr = (request.remote_addr or "").strip()
+    if addr.startswith("::ffff:"):       # IPv4-mapped IPv6
+        addr = addr[7:]
+    addr = addr.split("%", 1)[0]          # strip IPv6 zone id
+    return addr in _local_addrs()
+
+
+@app.route("/api/version")
+def api_version():
+    info = updater.status()
+    local = _is_local_request()
+    info["local"] = local
+    # The token is only ever handed to a request coming from this machine.
+    info["token"] = UPGRADE_TOKEN if (local and info.get("can_upgrade")) else None
+    return jsonify(info)
+
+
+@app.route("/api/upgrade", methods=["POST"])
+def api_upgrade():
+    if not _is_local_request():
+        return jsonify({"ok": False, "error": "只允许在安装机上操作升级"}), 403
+    payload = request.get_json(silent=True) or {}
+    if payload.get("token") != UPGRADE_TOKEN:
+        return jsonify({"ok": False, "error": "升级令牌无效，请刷新页面后重试"}), 403
+
+    result = updater.upgrade()
+    tracker.log_event("INFO", "upgrade {} -> {} ok={} {}".format(
+        result.get("from"), result.get("to"), result.get("ok"),
+        result.get("error") or "").strip())
+    if result.get("ok") and not result.get("up_to_date"):
+        # Answer the request first: execv() would otherwise cut the response off.
+        threading.Timer(1.0, _restart_for_upgrade).start()
+    return jsonify(result), (200 if result.get("ok") else 409)
+
+
+def _restart_for_upgrade() -> None:
+    """Replace this process with a fresh one, so the new code is what runs."""
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    try:
+        tracker.log_event("INFO", f"upgrade restart pid={os.getpid()} port={_PORT}")
+        os.execv(sys.executable, [sys.executable, os.path.abspath(__file__), str(_PORT)])
+    except Exception as e:
+        tracker.log_exception("upgrade restart", e)
+        os._exit(1)
+
+
 # ── Catch-up safety net ───────────────────────────────────────────────────────
 # The Stop hook is best-effort: headless/SDK sessions may never fire it, and when
 # it does fire the transcript for the finishing turn is not always flushed yet.
@@ -397,12 +478,17 @@ def _lan_ip() -> str:
 
 
 if __name__ == "__main__":
-    import sys
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 5001
+    _PORT = port
     lan_ip = _lan_ip()
     print(f"Claude Usage Dashboard")
     print(f"  Local  → http://localhost:{port}")
     print(f"  LAN    → http://{lan_ip}:{port}")
+    _ver = updater.local_state()
+    print(f"  Version → {_ver.get('short') or 'unknown'}"
+          f" ({_ver.get('date') or 'n/a'}, branch {_ver.get('branch') or '?'})")
+    if not _ver.get("is_git"):
+        print("  Update  → 不可用（不是 git 仓库），请手动升级")
     # Bring an older database up to date now, so a schema problem shows up here
     # rather than as a 500 on the first page load.
     try:
@@ -418,4 +504,5 @@ if __name__ == "__main__":
     tracker.log_event("INFO", f"dashboard start port={port} pid={os.getpid()} "
                               f"db={DB_PATH}")
     start_catchup_thread()
+    updater.start_background_checks()
     app.run(host="0.0.0.0", port=port, debug=False)

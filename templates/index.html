@@ -55,6 +55,7 @@ tailwind.config = {
     <button class="tab-btn px-4 py-1.5 rounded-lg text-sm font-medium text-slate-400 hover:text-white hover:bg-slate-800" data-tab="models">Models</button>
   </nav>
   <div class="ml-auto flex items-center gap-3">
+    <span id="version-pill" class="text-xs text-slate-600"></span>
     <span id="last-updated" class="text-xs text-slate-500"></span>
     <button onclick="refreshAll()" class="text-xs bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg text-slate-300 flex items-center gap-1.5">
       <svg id="refresh-icon" class="w-3.5 h-3.5" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 010 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.057a1 1 0 011.276.61A5.002 5.002 0 0014.001 13H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z" clip-rule="evenodd"/></svg>
@@ -743,7 +744,74 @@ async function initFilters() {
   })
 }
 
+// ── Version / one-click upgrade ──────────────────────────────────────────────
+// The server hands out an upgrade token only to requests from this machine, so
+// a LAN visitor — or a page on another origin — sees the version but no button.
+let VERSION = null
+
+function renderVersion(v) {
+  const el = document.getElementById('version-pill')
+  if (!el) return
+  const cur = v.current ? 'v' + v.current : ''
+  if (v.update_available && v.can_upgrade && v.token) {
+    el.className = 'flex items-center gap-2'
+    el.innerHTML = `<span class="text-xs text-slate-500">${cur}</span>
+      <button id="upgrade-btn" onclick="doUpgrade()"
+        class="text-xs bg-brand hover:bg-brand-dark px-3 py-1.5 rounded-lg text-white font-medium">
+        Update to ${v.latest}
+      </button>`
+  } else if (v.update_available) {
+    el.className = 'text-xs text-amber-400'
+    el.title = v.blocker || ''
+    el.textContent = `Update ${v.latest} available — run git pull`
+  } else {
+    el.className = 'text-xs text-slate-600'
+    el.textContent = v.is_git ? cur : 'manual install'
+    el.title = v.check_error || ''
+  }
+}
+
+async function checkVersion() {
+  try {
+    VERSION = await api('/api/version')
+    renderVersion(VERSION)
+  } catch (e) { /* the dashboard works fine without a version pill */ }
+}
+
+async function doUpgrade() {
+  if (!VERSION || !VERSION.token) return
+  if (!confirm(`Update to ${VERSION.latest} and restart the dashboard?`)) return
+  const btn = document.getElementById('upgrade-btn')
+  if (btn) { btn.disabled = true; btn.textContent = 'Updating…' }
+  try {
+    const res = await fetch('/api/upgrade', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: VERSION.token })
+    })
+    const data = await res.json()
+    if (!data.ok) {
+      alert('Update failed: ' + (data.error || 'unknown error'))
+      checkVersion()
+      return
+    }
+  } catch (e) {
+    // The restart can cut the response short; fall through and wait for it.
+  }
+  const el = document.getElementById('version-pill')
+  if (el) el.innerHTML = '<span class="text-xs text-slate-400">Restarting…</span>'
+  for (let i = 0; i < 40; i++) {
+    await new Promise(r => setTimeout(r, 1000))
+    try {
+      const r = await fetch('/api/version', { cache: 'no-store' })
+      if (r.ok) { location.reload(); return }
+    } catch (e) { /* still restarting */ }
+  }
+  location.reload()
+}
+
 // ── Boot ──────────────────────────────────────────────────────────────────────
+checkVersion()
 initFilters()
 loadOverview()
 loadDaily()
