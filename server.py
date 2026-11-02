@@ -4,9 +4,12 @@ Claude Code Usage Dashboard — local Flask server.
 Run: python3 server.py  (default port 5000)
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os
+import re
 import socket
 import sqlite3
 import subprocess
@@ -65,6 +68,7 @@ _setup_logging()
 # by an older version of the tracker — migrate it before serving instead of
 # returning a 500 on the first page load.
 _REQUIRED_SESSION_COLS = {"session_id", "im_source", "session_name", "transcript_path"}
+_REQUIRED_TABLES = {"sessions", "user_messages"}
 
 
 def get_db() -> sqlite3.Connection:
@@ -73,15 +77,53 @@ def get_db() -> sqlite3.Connection:
     con.execute("PRAGMA busy_timeout = 15000")
     try:
         cols = {r[1] for r in con.execute("PRAGMA table_info(sessions)")}
+        tables = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
     except sqlite3.DatabaseError:
-        cols = set()
-    if not _REQUIRED_SESSION_COLS <= cols:
+        cols, tables = set(), set()
+    if not _REQUIRED_SESSION_COLS <= cols or not _REQUIRED_TABLES <= tables:
         tracker.ensure_schema(con)
     return con
 
 
 def rows_to_list(rows) -> list[dict]:
     return [dict(r) for r in rows]
+
+
+def _clean_query(raw: str | None) -> str:
+    """Normalise a user search term; cap it so a pathological paste stays cheap."""
+    return (raw or "").strip()[:200]
+
+
+def _search_terms(raw: str | None) -> list[str]:
+    """Whitespace-separated keywords; every term must match (AND semantics)."""
+    terms = [t for t in _clean_query(raw).split() if t]
+    return terms[:6]
+
+
+def _like_pattern(text: str) -> str:
+    """Escape LIKE wildcards so a keyword containing % or _ is literal."""
+    escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _snippet(text: str, q: str, radius: int = 90) -> str:
+    """One-line context around the first hit, for search result rows."""
+    flat = re.sub(r"\s+", " ", (text or "").replace("\r", " ").replace("\n", " ")).strip()
+    if not flat:
+        return ""
+    best = None
+    lower = flat.lower()
+    for term in (_search_terms(q) or [q]):
+        idx = lower.find((term or "").lower())
+        if idx >= 0 and (best is None or idx < best[0]):
+            best = (idx, term)
+    if best is None:
+        return flat[:radius * 2] + ("…" if len(flat) > radius * 2 else "")
+    idx, term = best
+    start = max(0, idx - radius)
+    end = min(len(flat), idx + len(term) + radius)
+    return ("…" if start else "") + flat[start:end] + ("…" if end < len(flat) else "")
 
 
 # ── Period helpers ────────────────────────────────────────────────────────────
@@ -146,36 +188,43 @@ def daily():
 
 @app.route("/api/sessions")
 def sessions():
-    limit   = min(int(request.args.get("limit", 50)), 200)
-    offset  = int(request.args.get("offset", 0))
+    limit   = min(max(int(request.args.get("limit", 50)), 1), 200)
+    offset  = max(int(request.args.get("offset", 0)), 0)
     project = request.args.get("project", "").strip()
     entry   = request.args.get("entrypoint", "").strip()
     im_only = request.args.get("im_only", "").strip()
-    q       = request.args.get("q", "").strip()          # ← 新增搜索关键词
+    q       = _clean_query(request.args.get("q", ""))   # sessions + prompts
 
     clauses, params = [], []
     if project:
-        clauses.append("project_slug LIKE ?")
-        params.append(f"%{project}%")
+        clauses.append("project_slug LIKE ? ESCAPE '\\'")
+        params.append(_like_pattern(project))
     if entry:
         clauses.append("entrypoint = ?")
         params.append(entry)
     if im_only == "1":
         clauses.append("im_source IS NOT NULL")
     if q:
-        # 跨字段模糊搜索
-        search_clause = """(
-            session_id         LIKE ?
-            OR project_slug   LIKE ?
-            OR cwd             LIKE ?
-            OR first_user_message LIKE ?
-            OR git_branch      LIKE ?
-            OR entrypoint      LIKE ?
-            OR im_source       LIKE ?
-        )"""
-        clauses.append(search_clause)
-        q_pattern = f"%{q}%"
-        params.extend([q_pattern] * 7)
+        # Session fields plus every user prompt in the session. This is what
+        # turns the search box from "find a session id" into "find what I asked".
+        # Multiple whitespace-separated terms are ANDed.
+        for term in _search_terms(q):
+            clauses.append("""(
+                session_id         LIKE ? ESCAPE '\\'
+                OR project_slug    LIKE ? ESCAPE '\\'
+                OR cwd             LIKE ? ESCAPE '\\'
+                OR first_user_message LIKE ? ESCAPE '\\'
+                OR git_branch      LIKE ? ESCAPE '\\'
+                OR entrypoint      LIKE ? ESCAPE '\\'
+                OR im_source       LIKE ? ESCAPE '\\'
+                OR session_name    LIKE ? ESCAPE '\\'
+                OR EXISTS (
+                    SELECT 1 FROM user_messages um
+                    WHERE um.session_id = sessions.session_id
+                      AND um.content LIKE ? ESCAPE '\\'
+                )
+            )""")
+            params.extend([_like_pattern(term)] * 9)
 
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
@@ -187,15 +236,91 @@ def sessions():
                total_cache_creation_tokens, total_cache_read_tokens,
                total_cost_usd, total_turns, total_api_calls, total_tool_calls,
                total_thinking_blocks, duration_seconds,
-               models_used, first_user_message, im_source, session_name
+               models_used, first_user_message, im_source, session_name,
+               (SELECT COUNT(*) FROM user_messages um
+                WHERE um.session_id = sessions.session_id) AS prompt_count,
+               (SELECT substr(um.content, 1, 500) FROM user_messages um
+                WHERE um.session_id = sessions.session_id
+                ORDER BY um.seq_in_session, um.id LIMIT 1) AS first_prompt
         FROM sessions {where}
         ORDER BY started_at DESC
         LIMIT ? OFFSET ?
     """, params + [limit, offset]).fetchall()
 
     total = con.execute(f"SELECT COUNT(*) FROM sessions {where}", params).fetchone()[0]
+    data = rows_to_list(rows)
+
+    if q:
+        terms = _search_terms(q)
+        sids = [r["session_id"] for r in data]
+        if sids and terms:
+            marks = ",".join("?" * len(sids))
+            prompt_where = " AND ".join(["content LIKE ? ESCAPE '\\'"] * len(terms))
+            prompt_params = [_like_pattern(t) for t in terms]
+            counts = {
+                row["session_id"]: row["n"]
+                for row in con.execute(
+                    f"SELECT session_id, COUNT(*) AS n FROM user_messages "
+                    f"WHERE session_id IN ({marks}) AND {prompt_where} "
+                    f"GROUP BY session_id",
+                    sids + prompt_params)
+            }
+            for r in data:
+                n = counts.get(r["session_id"], 0)
+                r["prompt_matches"] = n
+                r["matched_prompts"] = []
+                if n:
+                    hits = con.execute(
+                        "SELECT uuid, seq_in_session, timestamp, content, is_command, source "
+                        "FROM user_messages WHERE session_id = ? "
+                        f"AND {prompt_where} "
+                        "ORDER BY seq_in_session LIMIT 3",
+                        [r["session_id"]] + prompt_params).fetchall()
+                    r["matched_prompts"] = [
+                        {**dict(h), "snippet": _snippet(h["content"], q)} for h in hits
+                    ]
+
     con.close()
-    return jsonify({"sessions": rows_to_list(rows), "total": total, "offset": offset, "limit": limit})
+    return jsonify({"sessions": data, "total": total, "offset": offset, "limit": limit})
+
+
+@app.route("/api/prompts")
+def prompts():
+    """Prompt-level search: one row per matching question, newest first."""
+    q      = _clean_query(request.args.get("q", ""))
+    limit  = min(max(int(request.args.get("limit", 20)), 1), 100)
+    offset = max(int(request.args.get("offset", 0)), 0)
+    if not q:
+        return jsonify({"prompts": [], "total": 0, "offset": offset, "limit": limit, "q": q})
+
+    con = get_db()
+    terms = _search_terms(q)
+    if not terms:
+        con.close()
+        return jsonify({"prompts": [], "total": 0, "offset": offset, "limit": limit, "q": q})
+    where = " AND ".join(["content LIKE ? ESCAPE '\\'"] * len(terms))
+    prompt_params = [_like_pattern(t) for t in terms]
+    total = con.execute(
+        f"SELECT COUNT(*) FROM user_messages WHERE {where}",
+        prompt_params).fetchone()[0]
+    rows = con.execute(f"""
+        SELECT um.id, um.session_id, um.uuid, um.seq_in_session, um.timestamp,
+               um.content, um.char_count, um.is_command, um.source,
+               s.session_name, s.project_slug, s.cwd, s.started_at,
+               s.entrypoint, s.im_source
+        FROM user_messages um
+        JOIN sessions s ON s.session_id = um.session_id
+        WHERE {where}
+        ORDER BY um.timestamp DESC, um.id DESC
+        LIMIT ? OFFSET ?
+    """, prompt_params + [limit, offset]).fetchall()
+    con.close()
+
+    data = rows_to_list(rows)
+    for r in data:
+        r["snippet"] = _snippet(r.get("content", ""), q)
+        r.pop("content", None)   # result rows only need the snippet; the modal has the full text
+    return jsonify({"prompts": data, "total": total, "offset": offset, "limit": limit, "q": q})
 
 
 @app.route("/api/session/<sid>")
@@ -233,11 +358,28 @@ def session_detail(sid: str):
         ORDER BY calls DESC
     """, (full_sid,)).fetchall()
 
+    prompt_rows = con.execute("""
+        SELECT uuid, seq_in_session, timestamp, content, char_count,
+               is_command, source
+        FROM user_messages
+        WHERE session_id = ?
+        ORDER BY seq_in_session, id
+    """, (full_sid,)).fetchall()
+
     con.close()
+    user_prompts = rows_to_list(prompt_rows)
+    if not user_prompts and s["first_user_message"]:
+        # The upgrade backfill has not run yet on this database; still show what
+        # we know instead of an empty conversation panel.
+        legacy = tracker._first_message_prompt(
+            full_sid, s["started_at"], s["first_user_message"])
+        if legacy:
+            user_prompts = [legacy]
     return jsonify({
         "session": dict(s),
         "api_calls": rows_to_list(calls),
         "tool_summary": rows_to_list(tools),
+        "user_prompts": user_prompts,
     })
 
 
@@ -528,6 +670,9 @@ if __name__ == "__main__":
         # An upgraded install must show corrected prices immediately, not five
         # minutes later when the catch-up thread happens to run.
         tracker.migrate_pricing(_con)
+        # Same for the prompt history: on the first start after this feature
+        # lands, re-read existing transcripts now so the Sessions tab is useful.
+        tracker.maybe_backfill_user_messages(_con)
         _con.close()
         print("  DB     → schema up to date")
     except Exception as e:

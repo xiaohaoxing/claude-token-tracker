@@ -14,6 +14,7 @@ Usage (catch-up):   python3 tracker.py --catch-up
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -208,6 +209,23 @@ CREATE TABLE IF NOT EXISTS sessions (
     updated_at  TEXT DEFAULT (datetime('now'))
 );
 
+-- User prompts, extracted from the transcript. Tool results and system-injected
+-- records are excluded: this table answers "what did the user ask", which is
+-- what the dashboard shows as conversation history and searches.
+CREATE TABLE IF NOT EXISTS user_messages (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id     TEXT NOT NULL REFERENCES sessions(session_id),
+    uuid           TEXT,          -- transcript record UUID (stable across re-ingests)
+    seq_in_session INTEGER,       -- 1-based position among extracted prompts
+    timestamp      TEXT,
+    content        TEXT,          -- prompt text, capped at MAX_PROMPT_CHARS
+    char_count     INTEGER,       -- full length before capping
+    is_command     INTEGER DEFAULT 0,  -- slash command, normalised to "/name args"
+    source         TEXT DEFAULT 'transcript',  -- transcript | first_message
+    created_at     TEXT DEFAULT (datetime('now')),
+    UNIQUE(session_id, uuid)
+);
+
 CREATE TABLE IF NOT EXISTS api_calls (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id       TEXT NOT NULL REFERENCES sessions(session_id),
@@ -301,6 +319,8 @@ CREATE INDEX IF NOT EXISTS idx_tool_calls_name     ON tool_calls(tool_name);
 CREATE INDEX IF NOT EXISTS idx_sessions_started    ON sessions(started_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_cwd        ON sessions(cwd);
 CREATE INDEX IF NOT EXISTS idx_sessions_entrypoint ON sessions(entrypoint);
+CREATE INDEX IF NOT EXISTS idx_user_messages_session   ON user_messages(session_id, seq_in_session);
+CREATE INDEX IF NOT EXISTS idx_user_messages_timestamp ON user_messages(timestamp);
 """
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -319,6 +339,14 @@ def ensure_schema(con: sqlite3.Connection) -> None:
         con.execute("ALTER TABLE sessions ADD COLUMN im_source TEXT")
     if "session_name" not in cols:
         con.execute("ALTER TABLE sessions ADD COLUMN session_name TEXT")
+    # user_messages is newer than the first installs; a partially migrated table
+    # must not turn into a 500 on the dashboard's first query.
+    um_cols = {r[1] for r in con.execute("PRAGMA table_info(user_messages)")}
+    for name, ddl in (("is_command", "INTEGER DEFAULT 0"),
+                      ("source", "TEXT DEFAULT 'transcript'"),
+                      ("char_count", "INTEGER DEFAULT 0")):
+        if name not in um_cols:
+            con.execute(f"ALTER TABLE user_messages ADD COLUMN {name} {ddl}")
     con.commit()
 
 
@@ -337,6 +365,13 @@ def open_db(migrate: bool = True) -> sqlite3.Connection:
                           f"falling back to embedded Sonnet rates")
     if migrate:
         migrate_pricing(con)
+        # One-time (per extraction version) re-read of transcripts so installs
+        # that predate the prompts table get their conversation history without
+        # a manual --backfill. Failures must never block the hook.
+        try:
+            maybe_backfill_user_messages(con)
+        except Exception as e:
+            log_exception("prompt backfill", e)
     return con
 
 
@@ -352,11 +387,111 @@ def set_meta(con: sqlite3.Connection, key: str, value: str) -> None:
         ON CONFLICT(key) DO UPDATE SET value = excluded.value
     """, (key, str(value)))
 
+
+# ── User prompts ──────────────────────────────────────────────────────────────
+# Prompts are the only transcript content we persist. They make sessions
+# retrievable after Claude Code deletes the transcript (~30 days), and they are
+# what the Sessions tab shows as conversation history.
+MAX_PROMPT_CHARS = 20000
+# Bump when extraction rules change: the next open_db() re-reads every
+# transcript once and replaces the stored prompts.
+USER_MESSAGES_VERSION = "3"
+
+_COMMAND_BLOCK_RE = re.compile(
+    r"<command-message>.*?</command-message>\s*"
+    r"<command-name>(.*?)</command-name>\s*"
+    r"(?:<command-args>(.*?)</command-args>)?", re.S)
+
+# Records Claude Code injects on the user's behalf. None of them is a question
+# the user typed; storing them would bury real prompts under skill manuals.
+_NON_PROMPT_PREFIXES = (
+    "Base directory for this skill:",
+    "This session is being continued from a previous conversation",
+    "[Request interrupted by user",
+    "<local-command-",
+)
+
+
+def _normalise_prompt_text(text: str) -> str:
+    """Return the human-readable prompt, or "" for an injected record."""
+    text = (text or "").strip()
+    if not text or text.startswith(_NON_PROMPT_PREFIXES):
+        return ""
+    m = _COMMAND_BLOCK_RE.search(text)
+    if m:
+        name = (m.group(1) or "").strip()
+        args = (m.group(2) or "").strip()
+        text = (name + (" " + args if args else "")).strip()
+    return text
+
+
+def _is_command(text: str) -> int:
+    """Slash command, not an absolute path typed as part of a question."""
+    return 1 if re.match(r"^/[^\s/]+(?:\s|$)", text or "") else 0
+
+
+def _extract_user_messages(messages: list[dict]) -> list[dict]:
+    """Pull genuine human prompts out of a parsed transcript, in order."""
+    out: list[dict] = []
+    for m in messages:
+        if m.get("type") != "user" or m.get("isMeta") or m.get("isSidechain"):
+            continue
+        content = m.get("message", {}).get("content", "")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            # A user record carrying tool_result is the tool loop, not the user.
+            if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+                continue
+            text = "\n".join(
+                b.get("text", "") for b in content
+                if isinstance(b, dict) and b.get("type") == "text")
+        else:
+            continue
+        text = _normalise_prompt_text(text)
+        if not text:
+            continue
+        uuid = m.get("uuid") or ""
+        if not uuid:
+            # Deterministic fallback: a re-ingest updates instead of duplicating.
+            uuid = "sha1-" + hashlib.sha1(
+                f"{m.get('sessionId', '')}|{m.get('timestamp', '')}|{text}".encode("utf-8")
+            ).hexdigest()
+        out.append({
+            "session_id": m.get("sessionId", ""),
+            "uuid": uuid,
+            "seq_in_session": len(out) + 1,
+            "timestamp": m.get("timestamp", ""),
+            "content": text[:MAX_PROMPT_CHARS],
+            "char_count": len(text),
+            "is_command": _is_command(text),
+            "source": "transcript",
+        })
+    return out
+
+
+def _first_message_prompt(session_id: str, started_at: str | None,
+                          raw: str | None) -> dict | None:
+    """Build one prompt record from sessions.first_user_message (legacy fallback)."""
+    text = _normalise_prompt_text(raw or "")
+    if not text:
+        return None
+    return {
+        "session_id": session_id,
+        "uuid": f"first-{session_id}",
+        "seq_in_session": 1,
+        "timestamp": started_at or "",
+        "content": text[:MAX_PROMPT_CHARS],
+        "char_count": len(text),
+        "is_command": _is_command(text),
+        "source": "first_message",
+    }
+
 # ── JSONL parser ──────────────────────────────────────────────────────────────
 def parse_transcript(path: str) -> dict:
     """
     Parse a Claude Code session JSONL file.
-    Returns a dict with keys: session_meta, api_calls, tool_calls.
+    Returns a dict with keys: session_meta, api_calls, tool_calls, user_messages.
     """
     messages: list[dict] = []
     try:
@@ -406,20 +541,10 @@ def parse_transcript(path: str) -> dict:
         except ValueError:
             pass
 
-    # First user message text
-    first_user_message = None
-    for m in user_msgs:
-        content = m.get("message", {}).get("content", "")
-        if isinstance(content, str) and content.strip():
-            first_user_message = content[:500]
-            break
-        elif isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    first_user_message = block.get("text", "")[:500]
-                    break
-            if first_user_message:
-                break
+    # Genuine user prompts: tool results, sidechains and injected skill/system
+    # records are filtered out, so the list matches "what the user asked".
+    user_messages = _extract_user_messages(messages)
+    first_user_message = user_messages[0]["content"][:500] if user_messages else None
 
     # Extract session name from /rename command
     session_name = None
@@ -603,7 +728,8 @@ def parse_transcript(path: str) -> dict:
         "session_name":                session_name,
     }
 
-    return {"session_meta": session_meta, "api_calls": api_call_records, "tool_calls": tool_call_records}
+    return {"session_meta": session_meta, "api_calls": api_call_records,
+            "tool_calls": tool_call_records, "user_messages": user_messages}
 
 # ── DB writers ────────────────────────────────────────────────────────────────
 def upsert_session(con: sqlite3.Connection, meta: dict) -> None:
@@ -641,6 +767,8 @@ def upsert_session(con: sqlite3.Connection, meta: dict) -> None:
             total_thinking_blocks       = excluded.total_thinking_blocks,
             total_output_chars          = excluded.total_output_chars,
             models_used                 = excluded.models_used,
+            first_user_message          = COALESCE(excluded.first_user_message,
+                                                    sessions.first_user_message),
             transcript_path             = excluded.transcript_path,
             im_source                   = COALESCE(excluded.im_source, sessions.im_source),
             session_name                = COALESCE(excluded.session_name, sessions.session_name),
@@ -682,6 +810,61 @@ def insert_tool_calls(con: sqlite3.Connection, records: list[dict]) -> None:
                 :timestamp, :is_sidechain, :result_type, :result_size_bytes
             )
         """, r)
+
+
+def _insert_user_message(con: sqlite3.Connection, r: dict) -> None:
+    con.execute("""
+        INSERT OR IGNORE INTO user_messages (
+            session_id, uuid, seq_in_session, timestamp, content,
+            char_count, is_command, source
+        ) VALUES (
+            :session_id, :uuid, :seq_in_session, :timestamp, :content,
+            :char_count, :is_command, :source
+        )
+    """, r)
+
+
+def replace_user_messages(con: sqlite3.Connection, session_id: str,
+                          records: list[dict]) -> None:
+    """Replace a session's prompt history with the freshly parsed transcript.
+
+    Replace (not append) so a re-read repairs the rows when the extraction
+    rules change, and so a prompt removed upstream does not linger here.
+    """
+    con.execute("DELETE FROM user_messages WHERE session_id = ?", (session_id,))
+    for r in records:
+        r = dict(r)
+        r["session_id"] = session_id
+        _insert_user_message(con, r)
+
+
+def backfill_first_message_prompts(con: sqlite3.Connection) -> int:
+    """Give sessions without a transcript one searchable prompt, when possible.
+
+    Claude Code deletes transcripts after ~30 days. For those sessions the only
+    text we still have is sessions.first_user_message; storing it means older
+    history stays searchable instead of silently disappearing from the tab.
+
+    Legacy rows are rebuilt from scratch so a change to the extraction rules
+    (for example slash-command detection) also repairs old rows.
+    """
+    con.execute("DELETE FROM user_messages WHERE source = 'first_message'")
+    rows = con.execute("""
+        SELECT s.session_id, s.started_at, s.first_user_message
+        FROM sessions s
+        WHERE COALESCE(s.first_user_message, '') <> ''
+          AND NOT EXISTS (
+              SELECT 1 FROM user_messages um WHERE um.session_id = s.session_id
+          )
+    """).fetchall()
+    inserted = 0
+    for row in rows:
+        rec = _first_message_prompt(row["session_id"], row["started_at"],
+                                    row["first_user_message"])
+        if rec:
+            _insert_user_message(con, rec)
+            inserted += 1
+    return inserted
 
 
 def rebuild_daily_summary(con: sqlite3.Connection, dates: list[str]) -> None:
@@ -735,6 +918,7 @@ def process_session(con: sqlite3.Connection, session_id: str, transcript_path: s
     meta       = parsed["session_meta"]
     api_calls  = parsed["api_calls"]
     tool_calls = parsed["tool_calls"]
+    prompts    = parsed.get("user_messages", [])
 
     if not meta.get("session_id"):
         meta["session_id"] = session_id
@@ -746,6 +930,15 @@ def process_session(con: sqlite3.Connection, session_id: str, transcript_path: s
 
     upsert_session(con, meta)
     insert_api_calls(con, api_calls)
+
+    # Older / unusual transcripts may yield no prompt through the normal path;
+    # fall back to the stored first message so a session never shows an empty
+    # history when we still know what was asked.
+    if not prompts:
+        legacy = _first_message_prompt(meta["session_id"], meta.get("started_at"),
+                                       meta.get("first_user_message"))
+        prompts = [legacy] if legacy else []
+    replace_user_messages(con, meta["session_id"], prompts)
 
     # tool_calls table: avoid duplicates on re-runs by checking (api_call_uuid, tool_use_id)
     existing_tool_keys = set()
@@ -766,6 +959,47 @@ def process_session(con: sqlite3.Connection, session_id: str, transcript_path: s
     rebuild_daily_summary(con, dates)
     con.commit()
     return True
+
+
+def maybe_backfill_user_messages(con: sqlite3.Connection,
+                                 projects_dir: Path | str | None = None,
+                                 force: bool = False) -> int:
+    """Re-read every transcript once after the prompt schema/extraction changes.
+
+    Called from open_db(), so the hook, the CLI and the dashboard all repair an
+    older database automatically. It is version-gated: after the first run this
+    is a single SELECT. Returns the number of transcripts re-ingested.
+    """
+    if not force and get_meta(con, "user_messages_version") == USER_MESSAGES_VERSION:
+        return 0
+
+    base = Path(projects_dir) if projects_dir else PROJECTS_DIR
+    if not base.is_dir():
+        # Do not mark the version: a later run with the directory present must
+        # still be able to backfill. There is also nothing useful to log yet.
+        return 0
+
+    try:
+        files = sorted(base.rglob("*.jsonl"))
+    except OSError:
+        return 0
+
+    ingested = failed = 0
+    for f in files:
+        try:
+            if process_session(con, f.stem, str(f)):
+                ingested += 1
+        except Exception as e:
+            failed += 1
+            log_exception(f"prompt backfill {f.name}", e)
+    legacy = backfill_first_message_prompts(con)
+
+    set_meta(con, "user_messages_version", USER_MESSAGES_VERSION)
+    con.commit()
+    log_event("INFO", f"prompt backfill files={ingested}/{len(files)} "
+                      f"failed={failed} legacy_first_message={legacy} "
+                      f"version={USER_MESSAGES_VERSION}")
+    return ingested
 
 
 # ── Catch-up safety net ───────────────────────────────────────────────────────
@@ -1012,7 +1246,7 @@ def _db_report() -> list[str]:
             "SELECT name FROM sqlite_master WHERE type='table'")}
         lines.append(f"tables        : {', '.join(sorted(tables)) or '(none)'}")
         for t in ("sessions", "api_calls", "tool_calls", "daily_summary",
-                  "ingest_state", "tracker_meta"):
+                  "ingest_state", "user_messages", "tracker_meta"):
             if t not in tables:
                 lines.append(f"  MISSING     : {t}")
         if "sessions" in tables:
@@ -1020,9 +1254,16 @@ def _db_report() -> list[str]:
             missing = sorted({"session_id", "im_source", "session_name", "transcript_path"} - cols)
             lines.append(f"sessions cols : {len(cols)}"
                          + (f", MISSING {', '.join(missing)}" if missing else ", complete"))
-        for t in ("sessions", "api_calls", "tool_calls", "daily_summary", "ingest_state"):
+        for t in ("sessions", "api_calls", "tool_calls", "daily_summary",
+                  "ingest_state", "user_messages"):
             if t in tables:
                 lines.append(f"  rows {t:<14}: {con.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]}")
+        if "user_messages" in tables:
+            r = con.execute(
+                "SELECT COUNT(DISTINCT session_id), "
+                "COALESCE(SUM(CASE WHEN source='first_message' THEN 1 ELSE 0 END), 0) "
+                "FROM user_messages").fetchone()
+            lines.append(f"prompt sessions: {r[0]} ({r[1]} recovered from first message)")
         if "sessions" in tables:
             r = con.execute("SELECT MAX(started_at), MAX(updated_at) FROM sessions").fetchone()
             lines.append(f"latest session: {r[0]} (row updated {r[1]})")
@@ -1279,16 +1520,20 @@ def run_backfill(projects_dir: str) -> None:
             log_exception(f"backfill {f.name}", e)
             skip += 1
     set_meta(con, "last_catchup", str(time.time()))
+    set_meta(con, "user_messages_version", USER_MESSAGES_VERSION)
+    legacy = backfill_first_message_prompts(con)
     con.commit()
     con.close()
-    log_event("INFO", f"backfill done ingested={ok} skipped={skip}")
+    log_event("INFO", f"backfill done ingested={ok} skipped={skip} "
+                      f"legacy_first_message={legacy}")
     print(f"Backfill done: {ok} sessions ingested, {skip} skipped.")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Claude Code token tracker")
     parser.add_argument("--backfill", metavar="PROJECTS_DIR",
-                        help="Scan all JSONL files in PROJECTS_DIR and ingest into SQLite")
+                        help="Scan all JSONL files in PROJECTS_DIR and rebuild sessions, "
+                             "token usage and user prompts")
     parser.add_argument("--catch-up", action="store_true",
                         help="Ingest transcripts that are new or changed since the last scan")
     parser.add_argument("--doctor", action="store_true",

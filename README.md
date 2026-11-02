@@ -6,11 +6,31 @@
 
 Track your Claude Code usage — tokens, cost, and sessions — in a local SQLite database, and explore the data through a web dashboard.
 
+## Features
+
+- **Automatic tracking** — a Stop hook records every finished turn; a catch-up
+  pass rescans `~/.claude/projects/` so headless/SDK runs and turns that were
+  not flushed in time are not lost.
+- **Conversation history** — extracts the real user prompts from each transcript
+  (tool results, subagent sidechains and injected system content are filtered
+  out) and keeps them per session in SQLite.
+- **Prompt search** — searches session fields and every stored user prompt.
+  Multiple keywords are ANDed; hits show one-line context, and clicking one
+  opens the session at that exact question.
+- **Dashboard** — Overview, Sessions, Projects, Tools and Models tabs with cost
+  trends, token breakdowns, entrypoint/model splits and per-session detail.
+- **Cost accounting** — a local `pricing.json` price book with peak/idle tiers,
+  multiple currencies and historical repricing after a rate change.
+- **CLI & diagnostics** — quick queries with `stats.py`; a shareable, redacted
+  report with `tracker.py --doctor`.
+- **Versions & upgrades** — releases are git tags; the dashboard detects newer
+  tags and can fast-forward/restart itself from the install machine.
+
 ## Screenshots
 
 ![Overview](static/images/claude-token-tracker-overview-1.png)
 
-![Sessions](static/images/claude-token-tracker-sessions-2.png)
+![Sessions and prompt search](static/images/claude-token-tracker-sessions-2.png)
 
 ![Projects](static/images/claude-token-tracker-projects-3.png)
 
@@ -141,7 +161,7 @@ Also accessible from other devices on the same LAN: `http://<your-lan-ip>:5001`
 | Tab | What you'll see |
 |-----|-----------------|
 | Overview | Today / week / month / all-time cost cards, daily cost chart, token breakdown chart, entrypoint & model distribution |
-| Sessions | Full session list with search/filter; click any row to drill into per-API-call detail |
+| Sessions | Full session list with search/filter, including keyword search over every user prompt; each row previews the question, and clicking a row shows the conversation history plus per-API-call detail |
 | Projects | Cost and token usage grouped by project directory |
 | Tools | How often each tool was called, error rates, average input/output sizes |
 | Models | Per-model token counts and cost |
@@ -206,6 +226,37 @@ python3 tracker.py --backfill ~/.claude/projects/ # re-read everything
 Both are safe to run repeatedly (upsert + `INSERT OR IGNORE`). Catch-up is
 skipped while the dashboard is stopped only if you set
 `CLAUDE_TRACKER_NO_CATCHUP=1`.
+
+## Conversation history & prompt search
+
+The Sessions tab extracts the **actual user prompts** from each transcript and
+stores them in the SQLite `user_messages` table. Tool results, subagent
+sidechains, `isMeta` records and Claude Code's injected skill/system content are
+filtered out; slash commands are normalised to `/command args`.
+
+- The search box matches both session fields (ID, project, branch, entrypoint,
+  session name, …) and **every user prompt**. Separate multiple keywords with
+  spaces (AND semantics). When you type a keyword, a **Prompt matches** panel
+  appears above the table with one-line context.
+- Clicking a prompt hit opens the session and scrolls to / highlights that exact
+  question.
+- The session modal shows the full prompt history in chronological order (each
+  prompt is capped at 20,000 characters); long sessions scroll inside the prompt
+  panel.
+- The first start after upgrading re-reads existing transcripts automatically.
+  You can also force it:
+
+```bash
+python3 tracker.py --backfill ~/.claude/projects/
+```
+
+> Claude Code deletes transcripts after ~30 days. For sessions whose transcript
+> is already gone, the tracker can only recover the **first** prompt from
+> `sessions.first_user_message`; those rows are tagged `first only`.
+>
+> Prompt text stays in the local database and outlives the transcript. The
+> dashboard has no authentication, so anyone who can reach it on your LAN can
+> read it — treat it as sensitive.
 
 ## IM Session Tagging
 

@@ -35,6 +35,10 @@ tailwind.config = {
   .spin { animation: spin 1s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
   .chart-wrap { position: relative; height: 260px; }
+  .prompt-text { white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
+  .prompt-text mark { background: #7c3aed66; color: #ede9fe; border-radius: 2px; padding: 0 1px; }
+  .prompt-flash { animation: prompt-flash 1.8s ease; }
+  @keyframes prompt-flash { from { background: #4c1d95; } to { background: transparent; } }
   input, select { background: #1a1f2e; border: 1px solid #374151; border-radius: 8px; color: #e2e8f0; padding: 6px 12px; font-size:.875rem; }
   input:focus, select:focus { outline: none; border-color: #8b5cf6; }
 </style>
@@ -110,7 +114,7 @@ tailwind.config = {
 <!-- ═══════════════════ SESSIONS TAB ═══════════════════ -->
 <div id="tab-sessions" class="tab-content hidden p-6 space-y-4">
   <div class="flex items-center gap-3 flex-wrap">
-    <input id="filter-search" placeholder="Search sessions…" class="w-56" oninput="debounceLoadSessions()" />
+    <input type="search" id="filter-search" placeholder="Search sessions & prompts…" class="w-72" oninput="debounceLoadSessions()" />
     <input id="filter-project" placeholder="Filter by project…" class="w-48" oninput="debounceLoadSessions()" />
     <select id="filter-entry" onchange="loadSessions()">
       <option value="">All entrypoints</option>
@@ -122,6 +126,15 @@ tailwind.config = {
     <span class="text-xs text-slate-500 ml-auto" id="sessions-count"></span>
   </div>
 
+  <div id="prompt-hits" class="card p-4 hidden">
+    <div class="flex items-center gap-2 mb-1">
+      <h3 class="font-semibold text-white text-sm">Prompt matches</h3>
+      <span class="text-xs text-slate-500" id="prompt-hits-count"></span>
+      <button onclick="clearSearch()" class="ml-auto text-xs text-slate-400 hover:text-white">Clear search</button>
+    </div>
+    <div id="prompt-hits-list" class="divide-y divide-slate-800 max-h-72 overflow-auto"></div>
+  </div>
+
   <div class="card overflow-hidden">
     <div class="overflow-auto max-h-[calc(100vh-220px)]">
       <table class="tbl w-full text-sm">
@@ -129,6 +142,7 @@ tailwind.config = {
           <tr>
             <th class="text-left">Session</th>
             <th class="text-left">Name</th>
+            <th class="text-left">Prompt</th>
             <th class="text-left">Started</th>
             <th class="text-left">Project</th>
             <th class="text-left">Via</th>
@@ -275,7 +289,23 @@ const fmtDur = s => {
   return `${ss}s`
 }
 const fmtDate = ts => ts ? ts.slice(0,16).replace('T',' ') : '—'
-const esc = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+const esc = s => String(s||'').replace(/[&<>"']/g, c => (
+  { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]
+))
+
+// Highlight every search term inside already-user-supplied text. Escaping first
+// keeps transcript content inert; queries containing HTML metacharacters simply
+// skip highlighting rather than corrupting the markup.
+function highlight(text, q) {
+  const safe = esc(text)
+  const terms = (q || '').trim().split(/\s+/).filter(t => t && !/[&<>"']/.test(t))
+  if (!terms.length) return safe
+  try {
+    const re = new RegExp(
+      '(' + terms.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')', 'gi')
+    return safe.replace(re, '<mark>$1</mark>')
+  } catch { return safe }
+}
 
 const COLORS = ['#8b5cf6','#06b6d4','#10b981','#f59e0b','#ef4444','#ec4899','#6366f1','#84cc16','#f97316','#14b8a6']
 
@@ -470,9 +500,9 @@ async function loadSessions() {
   const project = document.getElementById('filter-project').value
   const entry   = document.getElementById('filter-entry').value
   const imOnly  = document.getElementById('filter-im-only').checked ? '1' : ''
-  const q       = document.getElementById('filter-search').value
+  const q       = document.getElementById('filter-search').value.trim()
   const url = `/api/sessions?limit=${SESS_LIMIT}&offset=${sessOffset}&project=${encodeURIComponent(project)}&entrypoint=${encodeURIComponent(entry)}&im_only=${imOnly}&q=${encodeURIComponent(q)}`
-  const { sessions, total } = await api(url)
+  const [{ sessions, total }] = await Promise.all([api(url), loadPromptHits(q)])
 
   document.getElementById('sessions-count').textContent = `${total} sessions`
   document.getElementById('page-info').textContent =
@@ -481,14 +511,32 @@ async function loadSessions() {
   document.getElementById('next-page').disabled = sessOffset + SESS_LIMIT >= total
 
   const tbody = document.getElementById('sessions-tbody')
+  if (!sessions.length) {
+    tbody.innerHTML = `<tr><td colspan="13" class="py-10 text-center text-slate-500 text-sm">${
+      q ? `No sessions match “${esc(q)}”.` : 'No sessions match these filters.'
+    }</td></tr>`
+    return
+  }
   tbody.innerHTML = sessions.map(s => {
     const models = (() => { try { return JSON.parse(s.models_used||'[]') } catch { return [] } })()
     const modelTag = models.length ? `<span class="badge bg-violet-900/40 text-violet-300">${esc(models[0].replace('claude-',''))}</span>` : ''
     const entryColor = { cli:'bg-blue-900/40 text-blue-300', 'sdk-ts':'bg-teal-900/40 text-teal-300', 'sdk-python':'bg-green-900/40 text-green-300' }[s.entrypoint] || 'bg-slate-700 text-slate-300'
     const imBadge = s.im_source ? `<span class="badge bg-fuchsia-900/40 text-fuchsia-300 ml-1">IM</span>` : ''
+    const match = (s.matched_prompts || [])[0]
+    const previewText = match ? match.snippet : (s.first_prompt || s.first_user_message || '')
+    const promptBits = []
+    if (s.prompt_count) promptBits.push(`${s.prompt_count} prompt${s.prompt_count === 1 ? '' : 's'}`)
+    if (match && s.prompt_matches > 1) promptBits.push(`${s.prompt_matches} matched`)
+    if (match && match.is_command) promptBits.push('command')
     return `<tr class="cursor-pointer" onclick="openSession('${esc(s.session_id)}')">
       <td class="font-mono text-xs text-slate-400">${s.session_id.slice(0,8)}</td>
       <td class="text-xs text-white max-w-32 truncate">${esc(s.session_name || '—')}</td>
+      <td class="text-xs max-w-xs">
+        <div class="text-slate-300 truncate" title="${esc(previewText)}">${
+          previewText ? highlight(previewText, q) : '<span class="text-slate-600">—</span>'
+        }</div>
+        <div class="text-[10px] text-slate-500 mt-0.5">${promptBits.length ? esc(promptBits.join(' · ')) : '&nbsp;'}</div>
+      </td>
       <td class="text-xs text-slate-300">${fmtDate(s.started_at)}</td>
       <td class="font-medium text-white max-w-32 truncate">${esc(s.project_slug || s.cwd?.split('/').pop())}</td>
       <td><span class="badge ${entryColor}">${esc(s.entrypoint||'—')}</span>${imBadge}</td>
@@ -501,6 +549,54 @@ async function loadSessions() {
       <td class="text-right text-slate-400 text-xs">${fmtDur(s.duration_seconds)}</td>
     </tr>`
   }).join('')
+}
+
+async function loadPromptHits(q) {
+  const card = document.getElementById('prompt-hits')
+  const list = document.getElementById('prompt-hits-list')
+  if (!card || !list) return
+  if (!q) {
+    card.classList.add('hidden')
+    list.innerHTML = ''
+    return
+  }
+  card.classList.remove('hidden')
+  list.innerHTML = '<div class="text-xs text-slate-500 py-2">Searching prompts…</div>'
+  try {
+    const { prompts, total } = await api(`/api/prompts?q=${encodeURIComponent(q)}&limit=20`)
+    document.getElementById('prompt-hits-count').textContent = total
+      ? `${total} matching prompt${total === 1 ? '' : 's'}`
+        + (total > prompts.length ? ` · showing first ${prompts.length}` : '')
+      : ''
+    if (!prompts.length) {
+      list.innerHTML = '<div class="text-xs text-slate-500 py-2">No prompt matches. Session fields (id, project, branch…) are still searched in the table below.</div>'
+      return
+    }
+    list.innerHTML = prompts.map(p => {
+      const title = p.session_name || ('Session ' + p.session_id.slice(0, 8))
+      const project = p.project_slug || (p.cwd || '').split('/').pop()
+      return `<button class="w-full text-left px-2 py-2.5 rounded-lg hover:bg-slate-800/60 transition-colors"
+          onclick="openSession('${esc(p.session_id)}','${esc(p.uuid)}')">
+        <div class="flex items-center gap-2 text-[11px] text-slate-500 mb-1">
+          <span class="font-mono">${fmtDate(p.timestamp)}</span>
+          <span class="text-slate-300 truncate max-w-[14rem]">${esc(title)}</span>
+          <span class="truncate max-w-[10rem]">${esc(project)}</span>
+          ${p.is_command ? '<span class="badge bg-blue-900/40 text-blue-300">command</span>' : ''}
+          ${p.source === 'first_message' ? '<span class="badge bg-slate-700 text-slate-400" title="Transcript expired; only the first prompt is available">first only</span>' : ''}
+          <span class="ml-auto text-violet-400 shrink-0">Open ↗</span>
+        </div>
+        <div class="text-sm text-slate-300 prompt-text line-clamp-2">${highlight(p.snippet, q)}</div>
+      </button>`
+    }).join('')
+  } catch (e) {
+    list.innerHTML = `<div class="text-xs text-red-400 py-2">Prompt search failed: ${esc(e.message)}</div>`
+  }
+}
+
+function clearSearch() {
+  document.getElementById('filter-search').value = ''
+  sessOffset = 0
+  loadSessions()
 }
 
 function prevPage() { sessOffset = Math.max(0, sessOffset - SESS_LIMIT); loadSessions() }
@@ -627,13 +723,14 @@ async function loadModels() {
 }
 
 // ── Session detail modal ──────────────────────────────────────────────────────
-async function openSession(sid) {
+async function openSession(sid, focusPrompt = null) {
   document.getElementById('modal').classList.remove('hidden')
   document.getElementById('modal-body').innerHTML = `<div class="flex justify-center py-12"><svg class="spin w-8 h-8 text-violet-400" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2" opacity=".2"/><path d="M12 2a10 10 0 0110 10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></div>`
 
-  const { session: s, api_calls, tool_summary } = await api(`/api/session/${sid}`)
+  const { session: s, api_calls, tool_summary, user_prompts = [] } = await api(`/api/session/${sid}`)
   document.getElementById('modal-title').textContent = `${s.session_name ? s.session_name : 'Session ' + s.session_id.slice(0,8)} — ${s.project_slug || s.cwd?.split('/').pop()}`
 
+  const searchQ = document.getElementById('filter-search').value.trim()
   const metaRows = [
     ['Session ID', `<span class="font-mono text-xs">${s.session_id}</span>`],
     ['Session Name', esc(s.session_name || '—')],
@@ -643,6 +740,7 @@ async function openSession(sid) {
     ['Version', s.claude_version || '—'],
     ['Started', fmtDate(s.started_at)],
     ['Duration', fmtDur(s.duration_seconds)],
+    ['Prompts', user_prompts.length],
     ['Turns', s.total_turns],
     ['API calls', s.total_api_calls],
     ['Tool calls', s.total_tool_calls],
@@ -654,14 +752,40 @@ async function openSession(sid) {
     ['Cost', `<span class="text-violet-300 font-bold">${fmtC(s.total_cost_usd)}</span>`],
   ]
 
-  const firstMsg = s.first_user_message
-    ? `<div class="mt-3 text-xs text-slate-400 bg-slate-800/50 rounded-lg p-3 line-clamp-3">${esc(s.first_user_message.slice(0,300))}…</div>` : ''
+  const promptSection = user_prompts.length ? `
+    <div>
+      <div class="flex items-baseline gap-2 mb-3">
+        <h4 class="font-semibold text-white text-sm">User Prompts (${user_prompts.length})</h4>
+        <span class="text-xs text-slate-500">the conversation history for this session</span>
+      </div>
+      <div class="space-y-2 max-h-96 overflow-auto rounded-lg border border-slate-700 p-2">
+        ${user_prompts.map((p, i) => `
+          <div id="prompt-${esc(p.uuid)}" class="rounded-lg bg-slate-800/50 p-3">
+            <div class="flex items-center gap-2 text-[11px] text-slate-500 mb-1.5">
+              <span class="font-mono text-slate-400">#${i+1}</span>
+              <span>${fmtDate(p.timestamp)}</span>
+              ${p.is_command ? '<span class="badge bg-blue-900/40 text-blue-300">command</span>' : ''}
+              ${p.source === 'first_message' ? '<span class="badge bg-slate-700 text-slate-400" title="Transcript expired; only the first prompt was recoverable">first only</span>' : ''}
+              <span class="ml-auto">${(p.char_count || 0).toLocaleString()} chars</span>
+            </div>
+            <div class="text-sm text-slate-200 prompt-text max-h-48 overflow-auto">${highlight(p.content, searchQ)}</div>
+            ${p.char_count > (p.content || '').length ? `<div class="text-[11px] text-amber-400/80 mt-1">Stored truncated to ${(p.content||'').length.toLocaleString()} chars</div>` : ''}
+          </div>`).join('')}
+      </div>
+      ${user_prompts.some(p => p.source === 'first_message') ? `
+        <p class="text-[11px] text-slate-600 mt-2">Older sessions show only the first prompt — Claude Code deletes transcripts after ~30 days.</p>` : ''}
+    </div>` : `
+    <div class="text-xs text-slate-500 bg-slate-800/50 rounded-lg p-3">
+      No user prompts captured for this session yet. Run
+      <code class="text-slate-400">python3 tracker.py --backfill ~/.claude/projects/</code>
+      to re-read transcripts.
+    </div>`
 
   document.getElementById('modal-body').innerHTML = `
     <div class="grid grid-cols-2 md:grid-cols-4 gap-2 text-sm">
       ${metaRows.map(([k,v]) => `<div class="bg-slate-800/50 rounded-lg p-3"><div class="text-xs text-slate-500 mb-0.5">${k}</div><div class="text-white">${v}</div></div>`).join('')}
     </div>
-    ${firstMsg}
+    ${promptSection}
 
     ${api_calls.length ? `
     <div>
@@ -723,6 +847,15 @@ async function openSession(sid) {
       </div>
     </div>` : ''}
   `
+
+  // A prompt hit in search results opens the modal on the exact question.
+  if (focusPrompt) {
+    const el = document.getElementById('prompt-' + focusPrompt)
+    if (el) {
+      el.classList.add('prompt-flash', 'ring-2', 'ring-brand')
+      setTimeout(() => el.scrollIntoView({ block: 'nearest', behavior: 'smooth' }), 80)
+    }
+  }
 }
 
 function closeModal() {

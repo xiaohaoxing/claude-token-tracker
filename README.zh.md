@@ -6,11 +6,27 @@
 
 自动追踪 Claude Code 的 token 用量和费用，数据存储在本地 SQLite 数据库中，并提供一个 Web 看板供查阅分析。
 
+## 功能
+
+- **自动追踪**：Stop hook 在每轮对话结束后写入数据；catch-up 兜底扫描
+  `~/.claude/projects/`，补上 headless/SDK 会话和未及时落盘的轮次。
+- **会话提问历史**：从 transcript 中提取真实用户提问并入库（过滤工具返回、
+  subagent 侧链和系统注入内容），在「会话」页签查看每个会话的完整提问历史。
+- **关键词检索**：搜索会话字段和全部用户提问，多个关键词用空格分隔（AND）；
+  命中结果直接展示提问上下文，点击后跳转到对应会话并高亮该条提问。
+- **Web 看板**：总览、会话、项目、工具、模型五个页签，包含费用趋势、
+  token 分类、入口/模型分布和会话级明细。
+- **费用核算**：按 `pricing.json` 本地计价，支持分时价格、多币种和价格修正后
+  重算历史数据。
+- **命令行与诊断**：`stats.py` 快速查询；`tracker.py --doctor` 生成可分享的
+  脱敏诊断报告。
+- **版本与升级**：版本由 git tag 驱动，看板可检测新版本并在安装机上一键快进升级。
+
 ## 效果截图
 
 ![总览](static/images/claude-token-tracker-overview-1.png)
 
-![会话](static/images/claude-token-tracker-sessions-2.png)
+![会话与提问搜索](static/images/claude-token-tracker-sessions-2.png)
 
 ![项目](static/images/claude-token-tracker-projects-3.png)
 
@@ -132,7 +148,7 @@ python3 server.py 8080     # 自定义端口
 | 页签 | 内容 |
 |------|------|
 | 总览 | 今日 / 本周 / 本月 / 累计费用卡片，每日费用折线图，token 分类堆叠图，入口和模型分布 |
-| 会话 | 完整会话列表，支持搜索和筛选；点击任意行可查看该会话每次 API 调用的 token 明细 |
+| 会话 | 完整会话列表，支持按会话字段或**用户提问关键词**搜索；每行显示提问预览；点击任意行查看该会话的用户提问历史、每次 API 调用的 token 明细 |
 | 项目 | 按项目目录汇总的费用和 token 用量 |
 | 工具 | 各工具的调用次数、报错率、平均输入/输出大小 |
 | 模型 | 各模型的 token 用量和费用占比 |
@@ -187,6 +203,30 @@ python3 tracker.py --backfill ~/.claude/projects/ # 全量重读
 
 两者都可重复执行（upsert + `INSERT OR IGNORE`），不会产生重复数据。
 如需在看板运行期间关闭兜底，可设置 `CLAUDE_TRACKER_NO_CATCHUP=1`。
+
+## 会话提问历史与搜索
+
+「会话」页签会从 transcript 中提取**真正的用户提问**，存进 SQLite 的
+`user_messages` 表。工具返回、subagent 侧链、`isMeta` 以及 Claude Code 注入的
+skill/system 内容都会被过滤掉；斜杠命令会归一化成 `/命令 参数`，方便阅读和检索。
+
+- 搜索框同时搜索会话字段（ID、项目、分支、入口、会话名等）和**全部用户提问**；
+  多个关键词用空格分隔（AND 关系）；输入关键词后，列表上方会出现「Prompt matches」，
+  列出一句话的匹配上下文。
+- 点击某条提问结果会打开对应会话，并自动滚动、高亮到那条提问。
+- 会话详情里按时间顺序展示完整提问历史（单条最多保留 20,000 字符），
+  长会话可以在提问列表内滚动查看。
+- 升级后第一次运行会自动重读一遍现有 transcript 来补齐历史；也可以手动执行：
+
+```bash
+python3 tracker.py --backfill ~/.claude/projects/
+```
+
+> Claude Code 大约 30 天后会删除 transcript。对于已经被删除的旧会话，追踪器只能
+> 从 `sessions.first_user_message` 恢复**第一条**提问，列表里会标成 `first only`。
+>
+> 提问正文会完整保存在本地数据库（比 transcript 活得更久）。看板本身没有登录鉴权，
+> 同一局域网内能打开看板的人也能看到这些内容，请按敏感数据对待。
 
 ## IM 会话标记
 
