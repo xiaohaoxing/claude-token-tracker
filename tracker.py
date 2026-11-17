@@ -436,7 +436,7 @@ def _extract_user_messages(messages: list[dict]) -> list[dict]:
     for m in messages:
         if m.get("type") != "user" or m.get("isMeta") or m.get("isSidechain"):
             continue
-        content = m.get("message", {}).get("content", "")
+        content = (m.get("message") or {}).get("content", "")
         if isinstance(content, str):
             text = content
         elif isinstance(content, list):
@@ -550,7 +550,7 @@ def parse_transcript(path: str) -> dict:
     session_name = None
     for m in messages:
         if m.get("type") == "system" and m.get("subtype") == "local_command":
-            msg_content = m.get("content", "")
+            msg_content = m.get("content") or ""
             if "/rename" in msg_content:
                 match = re.search(r'<command-args>(.*?)</command-args>', msg_content, re.DOTALL)
                 if match:
@@ -567,7 +567,7 @@ def parse_transcript(path: str) -> dict:
     # Track tool_result outcomes keyed by tool_use_id
     tool_results: dict[str, dict] = {}
     for m in user_msgs:
-        content = m.get("message", {}).get("content", [])
+        content = (m.get("message") or {}).get("content", [])
         if not isinstance(content, list):
             continue
         for block in content:
@@ -592,7 +592,12 @@ def parse_transcript(path: str) -> dict:
     grouped: dict[str, dict] = {}
     ordered_keys: list[str] = []
     for raw in assistant_msgs:
-        raw_msg = raw.get("message", {}) or {}
+        # An assistant record without a message object carries no usage; newer
+        # transcripts can contain such records (e.g. `"message": null`). Skip
+        # them instead of counting a phantom zero-token API call.
+        raw_msg = raw.get("message")
+        if not isinstance(raw_msg, dict):
+            continue
         key = raw_msg.get("id") or raw.get("uuid") or ""
         if key not in grouped:
             grouped[key] = {"first": raw, "blocks": []}
@@ -603,14 +608,19 @@ def parse_transcript(path: str) -> dict:
 
     for seq, key in enumerate(ordered_keys, start=1):
         m       = grouped[key]["first"]
-        msg     = m.get("message", {})
-        usage   = msg.get("usage", {})
+        # JSON null is not the same as a missing key: `.get(key, {})` still
+        # returns None when the record literally contains `"message": null`,
+        # and newer transcripts do emit null for optional objects. Normalise
+        # before touching nested fields, or one such record kills the whole
+        # Stop hook (AttributeError: 'NoneType' object has no attribute 'get').
+        msg     = m.get("message") or {}
+        usage   = msg.get("usage") or {}
         content = grouped[key]["blocks"]
 
         model       = msg.get("model", "")
         message_id  = msg.get("id", "")
         stop_reason = msg.get("stop_reason", "")
-        stu         = usage.get("server_tool_use", {})
+        stu         = usage.get("server_tool_use") or {}
         timestamp   = m.get("timestamp", "")
 
         inp          = usage.get("input_tokens", 0) or 0
@@ -1161,10 +1171,10 @@ def _hook_report() -> list[str]:
         lines.append(f"  cannot parse  : {e}")
         return lines
 
-    groups = data.get("hooks", {}).get("Stop", []) or []
+    groups = (data.get("hooks") or {}).get("Stop", []) or []
     ours, others = [], 0
     for g in groups:
-        for h in g.get("hooks", []) or []:
+        for h in (g.get("hooks") or []):
             cmd = h.get("command", "")
             if "token-tracker" in cmd or re.search(r"hook\.sh|tracker\.py", cmd):
                 ours.append(cmd)
